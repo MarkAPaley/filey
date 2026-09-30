@@ -1,0 +1,24 @@
+Privacy Policy
+
+filey (this “App”) does not transmit information to anyone, other than
+making requests for web pages from www.epguides.com .
+
+It does not even print your name (although your OS username might be
+stored in the INI file as part of your directory location
+configuration).
+
+The App reads a text file and web pages from www.epguides.com , for TV
+series that you select, based upon names of files that you drop onto the
+App.
+
+The App creates some working dBase DBF files, which it uses to lookup
+standardized names for those files, and then offers to change your
+filenames into the new standardized formats.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -1,0 +1,38 @@
+Filey - Rename TV episode files consistently
+https://gitlab.com/MarkAPaley/filey
+
+Copyright (C) 2026 Mark A Paley
+
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program; if not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0.html>.
+
+Report bugs and questions at <https://gitlab.com/MarkAPaley/filey/-/issues>.
+
+
+This program contains embedded copies of "ffprobe.exe" (Windows), also free software redistributable under the GNU General Public License.  See ffprobe's license with the terminal command "ffprobe -L"  or at https://ffmpeg.org/ffprobe.html.
+
+This program contains embedded copies of "mkvmerge.exe" and "mkvpropedit.exe" (Windows), tools to update Matroska file tags, licensed under GPLv2, see: https://gitlab.com/mbunkus/mkvtoolnix/-/blob/main/COPYING, downloaded from: https://mkvtoolnix.download.
+
+This program contains embedded copies of "libeay32.dll" and "ssleay32.dll" (Windows), an open source client/server communications library, downloaded from https://github.com/IndySockets/OpenSSL-Binaries, licensed under the Indy Modified BSD License, see: https://www.indyproject.org/license.
+
+
+LINUX
+
+On Linux, filey uses the copies of ffprobe, mkvmerge, mkvpropedit and OpenSSL installed on your system; it does not include its own. (If Wine is installed, it can also run the Windows copies above.) About > Info shows which ones were found, and the command that installs any that are missing.
+
+OpenSSL is needed to download show and episode lists. Practically every Linux desktop already has it. Only the OpenSSL runtime library is used, so "libssl-dev" is NOT needed. To install it if it is missing, at the Terminal prompt enter the line for your distribution:
+
+  Ubuntu, Debian, Linux Mint, Zorin OS:  sudo apt install openssl
+  openSUSE:                              sudo zypper install openssl
+  Fedora:                                sudo dnf install openssl
+  Arch Linux, Manjaro:                   sudo pacman -S openssl
+
+ffprobe reads video details (resolution, codec, audio channels); mkvmerge and mkvpropedit read and update Matroska (.mkv) tags:
+
+  Ubuntu, Debian, Linux Mint, Zorin OS:  sudo apt install ffmpeg mkvtoolnix
+  openSUSE:                              sudo zypper install ffmpeg-tools mkvtoolnix
+  Fedora:                                sudo dnf install ffmpeg-free mkvtoolnix
+  Arch Linux, Manjaro:                   sudo pacman -S ffmpeg mkvtoolnix-cli
