@@ -327,7 +327,7 @@ function DbfHasIndex(aDB: TDbf; const AIndexName: String): Boolean;
 // ===== Navigation / field helpers =====
 // Moves to physical record N if it exists; leaves the dataset untouched and
 // returns False otherwise.
-function SafeGo(var aDB: TDbf; n: LongInt): Boolean;
+function SafeGo(const aDB: TDbf; n: LongInt): Boolean;
 
 // "FieldName= Value" plus a line ending, or '' if the field's display text
 // is blank. Used to build multi-field hint/tooltip strings.
@@ -436,7 +436,7 @@ begin
   if LText.IsNotBlank then Result := LField.FieldName + '= ' + LText + LE;
 end;
 
-function SafeGo(var aDB: TDbf; n: LongInt): Boolean;
+function SafeGo(const aDB: TDbf; n: LongInt): Boolean;
 begin
   Result := True;
   if (0 < n) and (n <= aDB.PhysicalRecordCount) then aDB.PhysicalRecNo := n

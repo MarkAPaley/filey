@@ -321,8 +321,9 @@ begin
 end;
 
 function TEpisodeMatcher.FormatEpStr(s: String): String;
-var
+const
   Delims: TSysCharSet = ['-', 'x', 'X', 'e', 'E'];
+var
   SeasonNumber, EpisodeNumber: Integer;
 begin
   Result := '';

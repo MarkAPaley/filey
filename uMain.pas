@@ -61,6 +61,8 @@ type
 
   // A map where Key = String and Value = Boolean
   TPathCacheMap = specialize TFPGMap<String, Boolean>;
+  // Full path (SubTracksKey) -> SubTracksFromProbe value. Sorted, for Find.
+  TSubTracksMap = specialize TFPGMap<String, String>;
 
   THackDBNavigator = class(TDBNavigator)
   end;
@@ -258,10 +260,56 @@ type
     // While True, ExtractFromSourceZip/ExtractZipResourceIfStale report
     // each extraction on the Progress page. Set only by CheckResourceFiles.
     FIsCheckingResources: Boolean;
+    // ExtractFromSourceZipParallel's jobs (ExtractJob): each entry's name
+    // in the zip, where it goes, and whether it got there. Set up before
+    // RunParallel starts and only read by the workers, except that each
+    // job writes its own FExtractOK entry.
+    FExtractDisks: TStringArray;
+    FExtractNames: TStringArray;
+    FExtractOK: TBooleanArray;
+    FExtractZip: String;
     FIsDestroyed: Boolean;
     FIsRenaming: Boolean;
     FIsScanning: Boolean;
     FIsShuttingDown: Boolean;
+    // ValidateAndDiscoverTools is running. It keeps the window responsive
+    // while the tools are checked, so a window activation (AppActivate)
+    // could otherwise start a second check inside the first.
+    FIsValidatingTools: Boolean;
+    // Episode-list pages being downloaded ahead of need during an episode
+    // lookup (StartEpsPrefetch), and their addresses at the same indexes.
+    // nil outside actLookupEpsExecute, and whenever there was nothing
+    // worth fetching ahead.
+    FEpsPrefetch: TBrowserDownloadBatch;
+    FEpsPrefetchURLs: TStringList;
+    // ImportShowsRows' parsing jobs (ImportParseJob): allshows.txt's
+    // lines, and for each line the title, directory and search key it
+    // gives and whether it gives a row at all. Each job writes only its
+    // own lines' entries.
+    FImportDirs: TStringArray;
+    FImportKeys: TStringArray;
+    FImportLines: TStrings;
+    FImportTitles: TStringArray;
+    FImportTotal: Integer;
+    FImportUse: TBooleanArray;
+    // MKV files renamed while a rename run is under way (BeginMKVBatch),
+    // waiting for their subtitle flags, title and tags (FlushMKVEdits):
+    // the folder each is in, its new name there, and the release group
+    // guessed from its old name. FMKVBatchDepth > 0 while a run is open;
+    // FMKVPhase is what FlushMKVEdits is doing, for the status bar.
+    FMKVBatchDepth: Integer;
+    FMKVJobDirs: TStringArray;
+    FMKVJobFiles: TStringArray;
+    FMKVJobGroups: TStringArray;
+    // Per queued MKV: its SubTracksFromProbe value, or '' when the parse
+    // pass didn't probe it (then FlushMKVEdits asks mkvmerge, as before).
+    FMKVJobSubTracks: TStringArray;
+    // Each probed MKV's subtitle tracks, from ffprobe's output in the
+    // parse pass (GetMKVAttributes), until RenameListItem renames that
+    // file and takes its entry (TakeProbedSubTracks). This is what spares
+    // FlushMKVEdits an mkvmerge run per file. Created in FormCreate.
+    FProbedSubTracks: TSubTracksMap;
+    FMKVPhase: String;
     // True from the constructor until DeferredStartup has finished; tables
     // aren't open before then.
     FIsStartingUp: Boolean;
@@ -275,6 +323,12 @@ type
     FPendingBrowserForce: Boolean;
     FPendingBrowserURL: String;
     FPieces: TSmartStrings;
+    // ffprobe results gathered in parallel by PrefetchProbes, for
+    // ParseFilesList's parse pass only (nil outside it). FProbePaths holds
+    // each probed path, unsorted, and FProbeOutputs the matching ffprobe
+    // output at the same index.
+    FProbeOutputs: TStringArray;
+    FProbePaths: TStringList;
     FProgressUpdateCounter: Integer;
     // Readme tab. vwReadme also shows the other documents FILEY-SRC.ZIP
     // carries (README_DOCS) when a link in one points at another - see
@@ -293,6 +347,12 @@ type
     // many times in a row is wasted, noticeable work. See
     // SmartAutoAdjustColumns.
     FShowsColumnsThrottle: TThrottledUI;
+    // For the AllShows filter callbacks, which run once per record on
+    // every keystroke: SHOWS.DBF field positions plus one (0 = not looked
+    // up yet; see ShowsFilterField), and aFilterText lower-cased once
+    // (FShowsNeedleLo) rather than once per record (see ShowsNeedleLower).
+    FShowsDirIdx, FShowsSearchIdx, FShowsTitleIdx: Integer;
+    FShowsNeedleLo, FShowsNeedleSrc: String;
     // True once SHOWS.DBF's SEARCHTHIS keys are known to be what the
     // current Key makes (SEARCH_KEY_VERSION). SaveConfiguration records it.
     FSearchKeysCurrent: Boolean;
@@ -346,8 +406,7 @@ type
     function ApplyReservedCharStyle(const AText: String): String;
     procedure ApplySpringColumn(const Grid: TDBGrid;
       const AIndex: Integer = -1);
-    procedure ApplyStandardColors(var ASynEdit: TSynEdit);
-    procedure ApplySubtitleFlags(const AFilePath: String);
+    procedure ApplyStandardColors(const ASynEdit: TSynEdit);
     // Offers, once, to move an AppImage run from Downloads, /tmp or
     // removable media to ~/Applications (see uOSDetector). Queued by
     // DeferredStartup so it comes after the window is up.
@@ -382,7 +441,7 @@ type
     procedure ConfigureDBFDataSource(aDbType: TDbType;
       ADataSource: TDataSource);
     procedure ConfigureOpenSSLLibPaths;
-    procedure ConfirmThenZapPackTable(var aDB: TDbf);
+    procedure ConfirmThenZapPackTable(const aDB: TDbf);
     // Puts ACommand on the clipboard and says so in the status bar.
     procedure CopyInstallCommand(const ACommand: String);
     procedure CreateDesktopShortcut;
@@ -404,6 +463,7 @@ type
     procedure DBGridAboutDblClick(Sender: TObject);
     procedure DBShowsStateChange(Sender: TObject);
     procedure DealWithSpecialFiles;
+    procedure DealWithSpecialFilesLoop(var Op: TRenameOperationState);
     procedure DeferredBrowse(Data: PtrInt);
     procedure DeferredReadmeLink({%H-}Data: PtrInt);
     procedure DeferredStartup(Data: PtrInt);
@@ -422,11 +482,15 @@ type
     function EnsureToolAvailable(var AFilePath: TFilePath;
       var AWinePrefix: String;
       const ALinuxExeName, AWindowsExeName, AVersionArg: String): Boolean;
+    function ExtractFromSourceZipParallel(const ANames: array of String;
+      const AOnlyIfMissing: array of Boolean): TBooleanArray;
+    procedure ExtractJob(AIndex: Integer);
+    procedure ExtractProgress(ADone, ATotal: Integer);
     function ExtractFromSourceZip(const AFileName: String;
       AOnlyIfMissing: Boolean = False): Boolean;
     procedure ExtractResourceToObject(const AFileName: TFilePath;
       AObject: TObject);
-    function ExtractZipResourceIfStale(aResourceName: String): Boolean;
+    function ExtractZipResourceIfStale(const AResourceName: String): Boolean;
     procedure FilterEpsOnTitle(DataSet: TDataSet; var Accept: Boolean);
     procedure FilterLogOnUndo(DataSet: TDataSet; var Accept: Boolean);
     procedure FilterShowsOnDirInTitle(DataSet: TDataSet;
@@ -434,6 +498,9 @@ type
     procedure FilterShowsOnExactTitle(DataSet: TDataSet;
       var Accept: Boolean);
     procedure FilterShowsOnTitleDir(DataSet: TDataSet; var Accept: Boolean);
+    function ShowsFilterField(DataSet: TDataSet; var AIdx: Integer;
+      const AName: String): TField;
+    function ShowsNeedleLower: String;
     procedure FinalizeShowsImport(aDB: TDbf; ProcessedCount: Integer;
       const StartTime: TDateTime);
     function FindExecutableFile(const FileName: String): String;
@@ -467,8 +534,17 @@ type
     function GetShowsTitle: String;
     function GetStreamFromZipResource(
       const AMemoryTarget: String): TMemoryStream;
-    function GetSubtitleTrackInfo(const AFilePath: String;
-      out AEnglishID: Integer): TSmartStrings;
+    procedure BeginMKVBatch;
+    procedure EndMKVBatch;
+    procedure FlushMKVEdits;
+    function MKVMergeIdentifyCommandLine(const AFileName: String): String;
+    procedure MKVProgress(ADone, ATotal: Integer);
+    procedure QueueMKVEdit(const ADir, AFileName, AOriginalName,
+      ASubTracks: String);
+    // FProbedSubTracks' entry for AFileName (its name before a rename),
+    // removed from the map; '' if there is none.
+    function TakeProbedSubTracks(const AFileName: String): String;
+    function SubtitleFlagArgsFromJSON(const AJSON: String): String;
     function GetUndo: Boolean;
     function HackFrom(const sFind: String;
       var s, sLeft, sRight: String): String;
@@ -476,6 +552,9 @@ type
     procedure HandBrowserPageToSystem(const AURL: String);
     procedure IHtmlViewer1LinkClick(Sender: TObject;
       const SRC: ThtString; var Handled: Boolean);
+    function ImportCancelCheck: Boolean;
+    procedure ImportParseJob(AIndex: Integer);
+    procedure ImportParseProgress(ADone, ATotal: Integer);
     function ImportShowsRows(aDB: TDbf; const CSVLines: TSmartStrings;
       TotalLines: Integer; const StartTime: TDateTime): Integer;
     procedure InitializeDBFs;
@@ -493,7 +572,7 @@ type
     procedure LazyLoadSourceCode;
     function LoadBrowserImages(const APageURL: String;
       ASources: TStrings): Integer;
-    function LoadBundledDoc(var AViewer: TSmartHtmlViewer;
+    function LoadBundledDoc(constref AViewer: TSmartHtmlViewer;
       const ADoc: String): Boolean;
     procedure LoadConfiguration(ini: TIniFile);
     function LoadResourceToString(const ResourceName: String): String;
@@ -505,7 +584,7 @@ type
     procedure LogSyncShowsEntryState(aDB: TDbf; const ShowsFile: String);
     function MakeSourceSheets: Integer;
     procedure MessageList(const Title: String; const SL: TStringList);
-    procedure MessageRenamedCount(var Op: TRenameOperationState);
+    procedure MessageRenamedCount(const Op: TRenameOperationState);
     // Names of the external tools not found, comma-separated; '' if none.
     function MissingToolNames: String;
     procedure MouseWheelScaleToFont(Sender: TObject;
@@ -522,8 +601,15 @@ type
     procedure ParseHTMLToMemo;
     function ParseTitleNEpNum(const curFile: String): String;
     procedure PerformTitleLookup;
-    procedure PostRecord(var aDB: TDbf);
+    procedure PostRecord(const aDB: TDbf);
+    procedure PrefetchProbes;
+    procedure StartEpsPrefetch;
+    procedure StopEpsPrefetch;
+    function TakePrefetchedEpsPage(const AURL: String;
+      out AContent: String): Boolean;
     procedure PrepareShowsTableForImport(aDB: TDbf);
+    procedure ProbeProgress(ADone, ATotal: Integer);
+    function ProbeCommandLine(const sFind: String): String;
     function ProbeFile(const sFind: String): String;
     procedure ProcessEpisodeLookup;
     function QueryThenRename(const ATargetPiece: String;
@@ -602,19 +688,29 @@ type
     // The File menu's "New file names" submenu (FNameStyleItems), made once
     // by SetupUI.
     procedure SetupNameStyleMenu;
+    // File menu > New file names, from and to the ini ([Main]
+    // ReservedCharacters and WordSeparator), and the submenu's check marks
+    // from g.ReservedCharStyle / g.WordSeparator.
+    procedure ReadNameStyle(ini: TIniFile);
+    procedure SyncNameStyleChecks;
+    procedure WriteNameStyle(ini: TIniFile);
     function ShowBrowserPage(APage: TBrowserDownload): Boolean;
     function ShowDataSetStates(const DataSet: TDataSet): String;
     procedure ShowDBFStatus(aDB: TDbf);
     procedure ShowEpisodeParsingStats;
     procedure ShowExtractProgress(const AFileName: String);
-    procedure ShowMessageList(var aList: TStringList);
     function ShowReadmeDoc(const ADoc: String; APosition: Integer;
       const AAnchor: String = ''): Boolean;
     procedure ShowStatusBrowser;
     procedure ShowStatusDBF(aDbType: TDbType);
     procedure ShowStatusSourceCode;
+    // The table whose status the bar shows for the page on view, from
+    // pcMain/pcAbout.ActivePage; False when that page shows something else.
+    function StatusBarDbType(out ADbType: TDbType): Boolean;
     procedure SmartAutoAdjustColumns(aGrid: TDBGrid;
       var AThrottle: TThrottledUI);
+    function ToolCheckCommandLine(const AWinePrefix, AExePath,
+      AVersionArg: String): String;
     procedure SwapFromTo(var Op: TRenameOperationState);
     function sYearAndEpNumOnlyNoEpName: String;
     procedure SyncShowsDatabase;
@@ -630,6 +726,7 @@ type
     // the keys that version retired, then records INI_VERSION.
     procedure UpgradeIniFile;
     procedure ValidateAndDiscoverTools;
+    procedure ValidateAndDiscoverToolsNow;
     procedure ViewerHotClick(Sender: TObject; const SRC: ThtString;
       var Handled: Boolean);
     procedure WriteSourceCodeFont(ini: TIniFile; APage: TTabSheet;
@@ -975,6 +1072,40 @@ const
   NAME_STYLE_RESERVED_UNDERSCORE = 1;
   NAME_STYLE_SPACES = 2;
   NAME_STYLE_DOTS = 3;
+  // filey.ini's one section: every setting lives under [Main].
+  INI_MAIN = 'Main';
+  // [Main] keys. Each name is written once here, so a reader and its
+  // writer can't disagree on spelling. (Source Code tab fonts are keyed by
+  // the tab's name instead - see WriteSourceCodeFont.)
+  INI_KEY_ASK_MOVE_APPIMAGE = 'AskMoveAppImage';
+  // Retired by IniVersion 3 (became ReservedCharacters); UpgradeIniFile
+  // still reads it once to carry an older ini's choice over.
+  INI_KEY_COLON_REPLACEMENT = 'ColonReplacement';
+  INI_KEY_CREATE_DESKTOP_SHORTCUT = 'IsCreateDesktopShortcut';
+  INI_KEY_CREATE_MENU_ENTRY = 'IsCreateMenuEntry';
+  INI_KEY_FONT_SETTINGS_VERSION = 'FontSettingsVersion';
+  INI_KEY_FORM_FONT_BOLD = 'Self.Canvas.Font.Bold';
+  INI_KEY_FORM_FONT_NAME = 'Self.Canvas.Font.Name';
+  INI_KEY_FORM_FONT_SIZE = 'Self.Canvas.Font.Size';
+  INI_KEY_HEIGHT = 'Height';
+  INI_KEY_INI_VERSION = 'IniVersion';
+  INI_KEY_INITIAL_DIR = 'InitialDir';
+  INI_KEY_LEFT = 'Left';
+  INI_KEY_SEARCH_KEY_VERSION = 'SearchKeyVersion';
+  INI_KEY_STATUSBAR_FONT_BOLD = 'StatusBar.Canvas.Font.Bold';
+  INI_KEY_STATUSBAR_FONT_NAME = 'StatusBar.Canvas.Font.Name';
+  INI_KEY_STATUSBAR_FONT_SIZE = 'StatusBar.Canvas.Font.Size';
+  INI_KEY_TOP = 'Top';
+  INI_KEY_WIDTH = 'Width';
+  // File menu > New file names, in the ini. Each value table is indexed by
+  // the choice itself, so ReadNameStyle, WriteNameStyle and UpgradeIniFile
+  // can't drift apart on spelling.
+  INI_KEY_RESERVED_CHARACTERS = 'ReservedCharacters';
+  INI_KEY_WORD_SEPARATOR = 'WordSeparator';
+  RESERVED_CHAR_INI_VALUES: array[TReservedCharStyle] of String =
+    ('lookalike', 'underscore');
+  WORD_SEPARATOR_INI_VALUES: array[TWordSeparator] of String =
+    ('space', 'dot');
 
 // ASaved if that font is installed here, else the first installed entry of
 // ADefaults, else AFallback. A font saved on another computer, or later
@@ -999,6 +1130,122 @@ end;
 function ShowsSearchKey(const ATitle, ADir: String): String;
 begin
   Result := sb(['|', ATitle.Key, '|', ADir.Key, '|']);
+end;
+
+// True for an ffprobe language tag that means English: the ISO 639-2 code
+// mkvmerge writes ('eng'), or a BCP 47 one ('en', 'en-US', ...) - the same
+// rule SubtitleFlagArgsFromJSON applies to mkvmerge's listing.
+function IsEnglishLanguageTag(const ATag: String): Boolean;
+var
+  s: String;
+begin
+  s := UTF8LowerCase(Trim(ATag));
+  Result := (s = 'eng') or (s = 'en') or s.StartsWith('en-');
+end;
+
+// An MKV's subtitle tracks, from ffprobe's -show_streams output, as
+// '<subtitle tracks>:<first English one>': '3:2' is three subtitle tracks,
+// the second of them English; '2:0' two, none English; '0:0' none at all.
+// '' when AProbe holds no stream listing (ffprobe missing or failed).
+// ffprobe lists a Matroska file's streams in the file's track order -
+// attachments come after, as streams of their own type - so the n-th
+// subtitle stream here is the track mkvpropedit calls track:s<n>.
+function SubTracksFromProbe(const AProbe: String): String;
+var
+  Lines: TSmartStrings;
+  bInStream, bIsSubtitle, bSawStream: Boolean;
+  i, iCount, iEnglish: Integer;
+  sLine, sLang: String;
+begin
+  Result := '';
+  if AProbe = '' then Exit;
+  bInStream := False;
+  bIsSubtitle := False;
+  bSawStream := False;
+  iCount := 0;
+  iEnglish := 0;
+  sLang := '';
+  Lines.Value.Text := AProbe;
+  for i := 0 to Lines.Value.Count - 1 do
+  begin
+    // Trim also drops the CR of a Windows ffprobe's CRLF line ends.
+    sLine := Trim(Lines.Value[i]);
+    if sLine = '[STREAM]' then
+    begin
+      bInStream := True;
+      bSawStream := True;
+      bIsSubtitle := False;
+      sLang := '';
+    end
+    else if sLine = '[/STREAM]' then
+    begin
+      if bInStream and bIsSubtitle then
+      begin
+        Inc(iCount);
+        if (iEnglish = 0) and IsEnglishLanguageTag(sLang) then
+          iEnglish := iCount;
+      end;
+      bInStream := False;
+    end
+    else if bInStream then
+    begin
+      if sLine = 'codec_type=subtitle' then bIsSubtitle := True
+      // Tag names keep the container's spelling; Matroska's is lower case,
+      // but nothing is lost by not relying on it.
+      else if UTF8LowerCase(sLine).StartsWith('tag:language=') then
+        sLang := Copy(sLine, Length('tag:language=') + 1, MaxInt);
+    end;
+  end;
+  if bSawStream then Result := sb([iCount, ':', iEnglish]);
+end;
+
+// The mkvpropedit arguments for a SubTracksFromProbe value: the same edits
+// SubtitleFlagArgsFromJSON makes from mkvmerge's listing (the first
+// English subtitle track made the default, forced one; both flags cleared
+// on every other subtitle track), but picking each track by type and
+// position (track:s1 is the first subtitle track) rather than by track
+// number. False, with AArgs '', if ASubTracks isn't such a value.
+function TrySubtitleFlagArgsFromSubTracks(const ASubTracks: String;
+  out AArgs: String): Boolean;
+var
+  i, iCount, iEnglish, k: Integer;
+  SB: TStringBuilder;
+begin
+  AArgs := '';
+  k := Pos(':', ASubTracks);
+  Result := (k > 1) and TryStrToInt(Copy(ASubTracks, 1, k - 1), iCount) and
+    TryStrToInt(Copy(ASubTracks, k + 1, MaxInt), iEnglish) and
+    (iCount >= 0) and (iEnglish >= 0) and (iEnglish <= iCount);
+  if not Result then Exit;
+  SB := TStringBuilder.Create;
+  try
+    for i := 1 to iCount do
+    begin
+      SB.Append(' --edit track:s').Append(i);
+      if i = iEnglish then
+        SB.Append(' --set flag-default=1 --set flag-forced=1')
+      else
+        SB.Append(' --set flag-default=0 --set flag-forced=0');
+    end;
+    AArgs := SB.ToString;
+  finally
+    SB.Free;
+  end;
+end;
+
+// The key FProbedSubTracks files a path under: expanded, then rejoined
+// with CombinePath, so the parse pass (curFile) and RenameListItem
+// (FROMPATH and FROM, rejoined) arrive at the same string for one file.
+// Windows file names ignore case, so there the key does too.
+function SubTracksKey(const AFileName: String): String;
+var
+  sFull: String;
+begin
+  sFull := ExpandFileName(AFileName);
+  Result := CombinePath(ExtractFilePath(sFull), ExtractFileName(sFull));
+  {$IFDEF WINDOWS}
+  Result := UTF8LowerCase(Result);
+  {$ENDIF}
 end;
 
 const
@@ -1422,37 +1669,45 @@ begin
   //   fill in. ParseFilesList now releases that guard before calling us,
   //   so LIST is already live.
   TotalCount := db.RecordCount;
-  db.First;
-  while (not db.EOF) and (not FIsShuttingDown) do
-  begin
-    try
-      UI.Check;
-      // Check if we should continue
-      if FIsShuttingDown then Break;
-      // Skip if already looked up
-      if GetListTo = '' then
-      begin
-        // Process this record
-        ProcessEpisodeLookup;
-        Inc(ProcessedCount);
-        // Update progress
-        if Assigned(StatusBar) then StatusBar.Panels[0].Text :=
-            Format('Processing %d of %d episodes...',
-            [ProcessedCount, TotalCount]);
-      end;
-      db.Next;
-    except
-      on E: Exception do
-      begin
-        LogError('Error processing episode lookup', E);
-        // Continue with next record
-        try
-          db.Next;
-        except
-          Break; // If we can't move to next, stop processing
+  // With several shows in this batch, their episode pages start
+  // downloading now, together, instead of one by one as each show's first
+  // file comes up.
+  StartEpsPrefetch;
+  try
+    db.First;
+    while (not db.EOF) and (not FIsShuttingDown) do
+    begin
+      try
+        UI.Check;
+        // Check if we should continue
+        if FIsShuttingDown then Break;
+        // Skip if already looked up
+        if GetListTo = '' then
+        begin
+          // Process this record
+          ProcessEpisodeLookup;
+          Inc(ProcessedCount);
+          // Update progress
+          if Assigned(StatusBar) then StatusBar.Panels[0].Text :=
+              Format('Processing %d of %d episodes...',
+              [ProcessedCount, TotalCount]);
+        end;
+        db.Next;
+      except
+        on E: Exception do
+        begin
+          LogError('Error processing episode lookup', E);
+          // Continue with next record
+          try
+            db.Next;
+          except
+            Break; // If we can't move to next, stop processing
+          end;
         end;
       end;
     end;
+  finally
+    StopEpsPrefetch;
   end;
   SetTabSheetListButtons;
   if Assigned(StatusBar) then StatusBar.Panels[0].Text :=
@@ -2110,7 +2365,7 @@ begin
         g.IsAskMoveAppImage := False;
         // Now, not only at exit, so a crash doesn't bring the question back.
         if not g.IsIniFileDeleted then
-          AppIni.Value.WriteBool('Main', 'AskMoveAppImage', False);
+          AppIni.Value.WriteBool(INI_MAIN, INI_KEY_ASK_MOVE_APPIMAGE, False);
         Exit;
       end;
     else
@@ -2757,7 +3012,7 @@ begin
     SpringColumn.Width := MIN_SPRING_WIDTH;
 end;
 
-procedure TForm1.ApplyStandardColors(var ASynEdit: TSynEdit);
+procedure TForm1.ApplyStandardColors(const ASynEdit: TSynEdit);
 const
   clNotepadQQ = TColor($FAFAFA);
   clOrange = TColor($00A5FF);
@@ -2778,43 +3033,6 @@ begin
   FP.Attribute[Ord(tkNumber)].Foreground := clOrange;
   FP.Attribute[Ord(tkString)].Foreground := clGray;
   FP.Attribute[Ord(tkSymbol)].Foreground := clNavy;
-end;
-
-procedure TForm1.ApplySubtitleFlags(const AFilePath: String);
-var
-  oTrackIDs: TSmartStrings;
-  sCommandLine: String;
-  iEnglishTrackInt: Integer;
-  i: Integer;
-  sCurrentID: String;
-  iCurrentIDInt: Integer;
-begin
-  // 1. Get the full subtitle track list and the first English track ID
-  // (if any) from a single mkvmerge invocation.
-  oTrackIDs := GetSubtitleTrackInfo(AFilePath, iEnglishTrackInt);
-  if oTrackIDs.Value.Count = 0 then Exit;
-  // 1a. mkvpropedit is used below to apply the flags GetSubtitleTrackInfo
-  // (mkvmerge) just found - re-verify it's still there before building a
-  // command line around it, same as mkvmerge just was.
-  if not EnsureMKVToolsAvailable(False, True) then Exit;
-  // 2. Build the command
-  sCommandLine := sb([g.WineMKVPropEdit + g.FilePathMKVPropEdit.Value,
-    ' ', AFilePath.Quote]);
-  for i := 0 to oTrackIDs.Value.Count - 1 do
-  begin
-    sCurrentID := oTrackIDs.Value[i];
-    iCurrentIDInt := StrToIntDef(sCurrentID, -1);
-    // Increment ID for mkvpropedit (0-based to 1-based)
-    sCommandLine := sCommandLine +
-      sb([' --edit track:@', IntToStr(iCurrentIDInt + 1)]);
-    // Logic: If this track is our target English track, enable it. Otherwise, disable.
-    if (iEnglishTrackInt <> -1) and (iCurrentIDInt = iEnglishTrackInt) then
-      sCommandLine := sCommandLine + ' --set flag-default=1 --set flag-forced=1'
-    else
-      sCommandLine := sCommandLine +
-        ' --set flag-default=0 --set flag-forced=0';
-  end;
-  RunEx(sCommandLine, True);
 end;
 
 procedure TForm1.AssignDBGridLogEvents;
@@ -3450,8 +3668,21 @@ const
   // every new build.
   SeedFiles: array[0..0] of String = ('SHOWS.DBF');
 var
-  FileName: String;
+  Names: TStringArray;
+  OnlyIfMissing, Present: TBooleanArray;
   PrevPage: TTabSheet;
+
+  procedure AddFile(const AName: String; AOnlyIfMissing: Boolean);
+  begin
+    SetLength(Names, Length(Names) + 1);
+    Names[High(Names)] := AName;
+    SetLength(OnlyIfMissing, Length(OnlyIfMissing) + 1);
+    OnlyIfMissing[High(OnlyIfMissing)] := AOnlyIfMissing;
+  end;
+
+var
+  FileName: String;
+  i: Integer;
 begin
   DebugLog('Enter CheckResourceFiles');
   PrevPage := pcMain.ActivePage;
@@ -3468,13 +3699,31 @@ begin
     // First, as everything else is extracted from it: a filey-src.zip left
     // by an older build would hand out that build's files.
     ExtractZipResourceIfStale(g.SourceZipFileName);
-    // libeay32.dll and ssleay32.dll are needed for Windows
+    // Everything else filey-src.zip supplies, apart from the tools, in one
+    // go: whichever of these need extracting are extracted side by side
+    // (ExtractFromSourceZipParallel). The tools follow in
+    // ValidateAndDiscoverTools, which extracts the ones it needs the same
+    // way. libeay32.dll and ssleay32.dll are needed for Windows only.
+    Names := nil;
+    OnlyIfMissing := nil;
+    if g.IsWindows then
+    begin
+      AddFile(uUtils.LIBEAY_NAME, False);
+      AddFile(uUtils.SSLEAY_NAME, False);
+    end;
+    for FileName in ResourceFiles do AddFile(FileName, False);
+    for FileName in SeedFiles do AddFile(FileName, True);
+    if not FIsShuttingDown then
+    begin
+      Present := ExtractFromSourceZipParallel(Names, OnlyIfMissing);
+      for i := 0 to High(Names) do
+        if not Present[i] then
+          DebugLog('CheckResourceFiles: failed to extract ' + Names[i]);
+    end;
     if g.IsWindows then
     begin
       g.FilePathlibeay := CombinePath(g.OpPath.Value, uUtils.LIBEAY_NAME);
-      ExtractFromSourceZip(uUtils.LIBEAY_NAME);
       g.FilePathssleay := CombinePath(g.OpPath.Value, uUtils.SSLEAY_NAME);
-      ExtractFromSourceZip(uUtils.SSLEAY_NAME);
       ConfigureOpenSSLLibPaths;
     end;
     DebugLog('CheckResourceFiles: before ValidateAndDiscoverTools');
@@ -3489,19 +3738,7 @@ begin
       ProgressLabel.Caption := StatusBar.Panels[0].Text;
     end;
     Application.ProcessMessages;
-    ValidateAndDiscoverTools;
-    for FileName in ResourceFiles do
-    begin
-      if FIsShuttingDown then Break;
-      if not ExtractFromSourceZip(FileName) then
-        DebugLog('CheckResourceFiles: failed to extract ' + FileName);
-    end;
-    for FileName in SeedFiles do
-    begin
-      if FIsShuttingDown then Break;
-      if not ExtractFromSourceZip(FileName, True) then
-        DebugLog('CheckResourceFiles: failed to extract ' + FileName);
-    end;
+    if not FIsShuttingDown then ValidateAndDiscoverTools;
   finally
     FIsCheckingResources := False;
   end;
@@ -3710,7 +3947,7 @@ begin
   DebugLog('Exit ConfigureOpenSSLLibPaths');
 end;
 
-procedure TForm1.ConfirmThenZapPackTable(var aDB: TDbf);
+procedure TForm1.ConfirmThenZapPackTable(const aDB: TDbf);
 var
   aDBGuard, dbShowsGuard: TDataLayoutGuard;
 begin
@@ -5166,13 +5403,27 @@ end;
 
 procedure TForm1.DealWithSpecialFiles;
 var
+  Op: TRenameOperationState;
+begin
+  Op := Default(TRenameOperationState);  //freshly zeroed, every time
+  // MKV files renamed below are given their subtitle flags, titles and
+  // tags together at the end (FlushMKVEdits) - see RenameThisList.
+  BeginMKVBatch;
+  try
+    DealWithSpecialFilesLoop(Op);
+  finally
+    EndMKVBatch;
+  end;
+end;
+
+// DealWithSpecialFiles' work, inside its MKV batch.
+procedure TForm1.DealWithSpecialFilesLoop(var Op: TRenameOperationState);
+var
   db: TDbf;
   FRegEx: TSmartRegEx;
   i, SpecialRecNo: Integer;
-  Op: TRenameOperationState;
   sTestExt, sTestName, sSpecialName, sTargetPiece: String;
 begin
-  Op := Default(TRenameOperationState);  //freshly zeroed, every time
   db := FDbf[dbList].aDB;
   FRegEx.Value.Expression := '^\d{8}$';
   // Same reset as RenameThisList: a leftover mrAll from a previous run
@@ -5724,6 +5975,104 @@ begin
   if Result and FIsCheckingResources then Inc(FExtractedCount);
 end;
 
+// ExtractFromSourceZip for several files at once: each of ANames is
+// brought up to date in g.OpPath - or, where AOnlyIfMissing[i] is True,
+// only put back if missing - and Result[i] says whether it is there (and
+// current) afterwards. The files that do need extracting are extracted
+// side by side on worker threads (RunParallel), each with its own
+// TUnZipper reading filey-src.zip, so the big ones - ffprobe.exe,
+// mkvmerge.exe, mkvpropedit.exe - decompress together instead of one
+// after another.
+//
+// Which files need it is decided here first, on the main thread, the same
+// way ExtractFromSourceZip decides it; that is usually just a directory
+// lookup per file (see uUtils.IsExtractedFileCurrent), so an ordinary
+// launch never shows the Progress page. One file alone goes through
+// ExtractFromSourceZip itself, keeping its percentage on the Progress page.
+function TForm1.ExtractFromSourceZipParallel(const ANames: array of String;
+  const AOnlyIfMissing: array of Boolean): TBooleanArray;
+var
+  bCurrent, bOnlyIfMissing: Boolean;
+  i, iJob: Integer;
+  Todo: TIntegerArray;
+  sDisk, sNames: String;
+begin
+  Result := nil;
+  SetLength(Result, Length(ANames));
+  Todo := nil;
+  for i := 0 to High(ANames) do
+  begin
+    bOnlyIfMissing := (i <= High(AOnlyIfMissing)) and AOnlyIfMissing[i];
+    sDisk := CombinePath(g.OpPath, ANames[i]);
+    if bOnlyIfMissing then bCurrent := FileExists(sDisk)
+    else
+      bCurrent := uUtils.IsExtractedFileCurrent(g.FilePathSourceZip.Value,
+        ANames[i], sDisk);
+    Result[i] := bCurrent;
+    if not bCurrent then
+    begin
+      SetLength(Todo, Length(Todo) + 1);
+      Todo[High(Todo)] := i;
+    end;
+  end;
+  if Length(Todo) = 0 then Exit;
+  if Length(Todo) = 1 then
+  begin
+    i := Todo[0];
+    Result[i] := ExtractFromSourceZip(ANames[i],
+      (i <= High(AOnlyIfMissing)) and AOnlyIfMissing[i]);
+    Exit;
+  end;
+  FExtractZip := g.FilePathSourceZip.Value;
+  FExtractNames := nil;
+  FExtractDisks := nil;
+  FExtractOK := nil;
+  SetLength(FExtractNames, Length(Todo));
+  SetLength(FExtractDisks, Length(Todo));
+  SetLength(FExtractOK, Length(Todo));
+  sNames := '';
+  for iJob := 0 to High(Todo) do
+  begin
+    FExtractNames[iJob] := ANames[Todo[iJob]];
+    FExtractDisks[iJob] := CombinePath(g.OpPath, ANames[Todo[iJob]]);
+    sNames := sb([sNames, IfThen(sNames.IsEmpty, '', ', '),
+      ANames[Todo[iJob]]]);
+  end;
+  // Only CheckResourceFiles shows the Progress page - see
+  // ExtractFromSourceZip.
+  if FIsCheckingResources then ShowExtractProgress(sNames);
+  try
+    RunParallel(Length(Todo), @ExtractJob, ParallelThreadCount(4),
+      @ExtractProgress);
+    for iJob := 0 to High(Todo) do
+    begin
+      Result[Todo[iJob]] := FExtractOK[iJob];
+      if FExtractOK[iJob] and FIsCheckingResources then Inc(FExtractedCount);
+    end;
+  finally
+    FExtractNames := nil;
+    FExtractDisks := nil;
+    FExtractOK := nil;
+  end;
+end;
+
+// One ExtractFromSourceZipParallel file, on a worker thread. ReplaceFromZip
+// touches nothing but its own files, the zip (read-only, through its own
+// TUnZipper) and extracted-files.txt (locked - see uUtils.ManifestLock).
+procedure TForm1.ExtractJob(AIndex: Integer);
+begin
+  FExtractOK[AIndex] := uUtils.ReplaceFromZip(FExtractZip,
+    FExtractNames[AIndex], FExtractDisks[AIndex], nil);
+end;
+
+// ExtractFromSourceZipParallel's progress: files finished, of how many.
+procedure TForm1.ExtractProgress(ADone, ATotal: Integer);
+begin
+  if not FIsCheckingResources or (ATotal <= 0) then Exit;
+  ProgressBar.Position := EnsureRange(Round(ADone * 100 / ATotal),
+    ProgressBar.Min, ProgressBar.Max);
+end;
+
 procedure TForm1.ExtractResourceToObject(const AFileName: TFilePath;
   AObject: TObject);
 var
@@ -5765,10 +6114,10 @@ end;
 // when missing, and replaced when it is another build's. Only the sizes
 // and central directories are compared (uUtils.SameZipArchive), so an
 // up-to-date copy costs a few KB of reading, not the whole archive.
-function TForm1.ExtractZipResourceIfStale(aResourceName: String): Boolean;
+function TForm1.ExtractZipResourceIfStale(const AResourceName: String): Boolean;
 var
   s: TSmartResourceStream;
-  OrigResourceName, sDiskName, sTempName: String;
+  sDiskName, sLookupName, sTempName: String;
 
   // True if sDiskName already holds exactly the embedded archive. One that
   // can't be read counts as stale, so it gets rewritten.
@@ -5803,7 +6152,7 @@ var
     // missing resource never flashes the Progress page.
     if FIsCheckingResources then
     begin
-      ShowExtractProgress(OrigResourceName);
+      ShowExtractProgress(AResourceName);
       CopyStreamWithProgress(s.Value, fs.Value, @ZipperProgress, Self);
     end
     else
@@ -5811,8 +6160,7 @@ var
   end;
 
 begin
-  if aResourceName.IsBlank then Exit(False);
-  OrigResourceName := aResourceName;
+  if AResourceName.IsBlank then Exit(False);
   // Deliberately a direct path in g.OpPath, NOT FileSearch. FileSearch's
   // sfoImplicitCurrentDir flag ALWAYS checks the process's current working
   // directory first, ahead of (and regardless of) the DirList passed in -
@@ -5825,9 +6173,8 @@ begin
   // root cause of every downstream "from ''" extraction failure,
   // independent of and in addition to the resource-name-casing issue fixed
   // below. The on-disk name is the one g.FilePathSourceZip uses (the name
-  // as passed in), not aResourceName, which by the time the resource is
-  // looked up holds the UPPERCASE resource-lookup name.
-  sDiskName := CombinePath(g.OpPath.Value, OrigResourceName);
+  // as passed in), not sLookupName, the UPPERCASE resource-lookup name.
+  sDiskName := CombinePath(g.OpPath.Value, AResourceName);
   sTempName := sDiskName + '.part';
   // The embedded RT_RCDATA resource itself, in contrast, is registered
   // under UpperCase(filename) - that's what Lazarus's own <Resources>
@@ -5836,10 +6183,10 @@ begin
   // the lowercased name (as before) silently failed to find the resource
   // on this platform, which is exactly the "g.FilePathSourceZip.Value
   // empty" symptom this function's own diagnostic comment below describes.
-  aResourceName := UpperCase(OrigResourceName);
+  sLookupName := UpperCase(AResourceName);
   // TEMPORARY DIAGNOSTIC - remove once the Wine embedded-resource extraction
   // failure is confirmed/fixed. TResourceStream.Create (inside s.Setup)
-  // raises if aResourceName isn't found as an RT_RCDATA resource in this
+  // raises if sLookupName isn't found as an RT_RCDATA resource in this
   // executable - previously that exception propagated uncaught out of here,
   // out of CheckResourceFiles, and up through the TForm1 constructor chain.
   // g.FilePathSourceZip.Value being empty in the field (mkvmerge.exe
@@ -5850,16 +6197,16 @@ begin
   // but this code was looking it up as lowercase "filey-src.zip" - a name
   // that resource simply isn't registered under, so s.Setup raised every
   // time on every platform, not just under Wine. Fixed by looking the
-  // resource up under UpperCase(OrigResourceName) instead. Logging +
+  // resource up under UpperCase(AResourceName) instead. Logging +
   // catching here still turns a failure into a recoverable, diagnosable
   // one, e.g. if a future rename of the embedded resource reintroduces a
   // mismatch.
   Result := False;
   try
     {$IFDEF WINDOWS}
-    s.Setup(HInstance, aResourceName, Windows.RT_RCDATA);
+    s.Setup(HInstance, sLookupName, Windows.RT_RCDATA);
     {$ELSE}
-    s.Setup(HInstance, aResourceName, RT_RCDATA);
+    s.Setup(HInstance, sLookupName, RT_RCDATA);
     {$ENDIF}
     // Opened first because it is what the copy on disk is compared with.
     if DiskCopyIsCurrent then Exit(True);
@@ -5875,7 +6222,7 @@ begin
 
     if IsDebugBuild then
       DebugLog(sb(['ExtractZipResourceIfStale: extracted "',
-        OrigResourceName, '" (looked up as "', aResourceName,
+        AResourceName, '" (looked up as "', sLookupName,
         '") to "', sDiskName, '", ', s.Value.Size, ' bytes']));
   except
     on E: Exception do
@@ -5883,7 +6230,7 @@ begin
       Result := False;
       DeleteIfExists(sTempName);
       LogError(sb(['ExtractZipResourceIfStale: could not extract "',
-        OrigResourceName, '" (looked up as "', aResourceName,
+        AResourceName, '" (looked up as "', sLookupName,
         '") from this executable''s embedded RT_RCDATA resources - ',
         IfThen(FileExists(sDiskName),
         'the copy already in OpPath is used this run.',
@@ -5908,50 +6255,91 @@ begin
   Accept := GetUndo;
 end;
 
+// The three AllShows filters run once per SHOWS.DBF record on every
+// keystroke in ShowsFilterEdit, three or four passes over ~13,700 records,
+// so each does as little per record as it can: fields by cached position
+// (ShowsFilterField) not FieldByName, the filter text lower-cased once
+// (ShowsNeedleLower) not per record, and the filter's description set by
+// whoever switches the filter on, not rewritten for every record.
+// Substring tests use plain Pos on UTF-8: UTF-8 is self-synchronising, so a
+// byte match of valid UTF-8 text is always a match of whole characters,
+// and only "found or not" is needed, not UTF8Pos's character index.
+
+// Not assigned anywhere at present. Whoever switches it on should also set
+// FDbf[dbShows].aFilterDescription := 'DIRinTITLE' (it used to do that
+// itself, for every record).
 procedure TForm1.FilterShowsOnDirInTitle(DataSet: TDataSet;
   var Accept: Boolean);
+var
+  sNeedle: String;
 begin
   Accept := True;
-  if DataSet.Active then
-  begin
-    { Set the description explicitly}
-    FDbf[dbShows].aFilterDescription :=
-      'DIRinTITLE';
-    if FDbf[dbShows].aFilterText = '' then Accept := True
-    else
-      { Using DataSet directly is faster and clearer than calling GetShowsDirectory}
-      { but if GetShowsDirectory is required for specific logic, use the explicit reference:}
-      Accept := UTF8ContainsText(DataSet.FieldByName('DIRECTORY').AsString,
-        FDbf[dbShows].aFilterText);
-  end;
+  if not DataSet.Active then Exit;
+  sNeedle := ShowsNeedleLower;
+  if sNeedle = '' then Exit;
+  Accept := Pos(sNeedle, UTF8LowerCase(ShowsFilterField(DataSet,
+    FShowsDirIdx, 'DIRECTORY').AsString)) > 0;
 end;
 
 procedure TForm1.FilterShowsOnExactTitle(DataSet: TDataSet;
   var Accept: Boolean);
 begin
   Accept := True;
-  // 1. Safety check
-  if DataSet.Active then
-  begin
-    // 2. Set the Filter Description using explicit array indexing
-    // Note: We use FDbf[dbEps].aFilterText instead of the naked 'aFilterText'
-
-    FDbf[dbShows].aFilterDescription := g.ExactFind;
-    // 3. Perform the actual filter logic
-    // Using DataSet directly (passed as parameter) is more reliable than aDB
-    Accept := UTF8ContainsText(DataSet.FieldByName('SEARCHTHIS').AsString,
-      g.ExactFind);
-  end;
+  if not DataSet.Active then Exit;
+  // Both sides are Key output (g.ExactFind := sFind.Key in FindMyTitle;
+  // SEARCHTHIS holds the Key of the title and of the directory), already
+  // upper-cased and normalised the same way, so an exact byte match is
+  // the right test - case-folding both again per record bought nothing.
+  Accept := Pos(g.ExactFind, ShowsFilterField(DataSet, FShowsSearchIdx,
+    'SEARCHTHIS').AsString) > 0;
 end;
 
 procedure TForm1.FilterShowsOnTitleDir(DataSet: TDataSet; var Accept: Boolean);
+var
+  sNeedle: String;
 begin
-  // Broad match: Keep the list populated with anything containing the string
+  // Broad match: keep the list populated with anything containing the
+  // string, so "Preacher" shows when "Reacher" isn't exactly what was
+  // wanted. An empty filter text matches nothing, as it always has.
+  sNeedle := ShowsNeedleLower;
+  Accept := (Pos(sNeedle, UTF8LowerCase(ShowsFilterField(DataSet,
+    FShowsTitleIdx, 'TITLE').AsString)) > 0) or
+    (Pos(sNeedle, UTF8LowerCase(ShowsFilterField(DataSet, FShowsDirIdx,
+    'DIRECTORY').AsString)) > 0);
+end;
 
-  // This allows the user to see "Preacher" in the grid if "Reacher" isn't exactly what they wanted.
-  Accept := UTF8ContainsText(DataSet.FieldByName('TITLE').AsString,
-    FDbf[dbShows].aFilterText) or UTF8ContainsText(
-    DataSet.FieldByName('DIRECTORY').AsString, FDbf[dbShows].aFilterText);
+// DataSet's field AName, by the position remembered in AIdx (plus one, so
+// 0 means not looked up yet). The positions are fixed by SHOWS.DBF's
+// schema (DbfMatchesSchema enforces it), so they stay right even when the
+// table is closed and reopened (ZapPackTable), which frees and recreates
+// the TField objects themselves - which is why positions are remembered
+// here, not TFields. The name check is a short, case-sensitive compare
+// and falls back to FieldByName if anything ever does move.
+function TForm1.ShowsFilterField(DataSet: TDataSet; var AIdx: Integer;
+  const AName: String): TField;
+begin
+  if (AIdx > 0) and (AIdx <= DataSet.FieldCount) then
+  begin
+    Result := DataSet.Fields[AIdx - 1];
+    if Result.FieldName = AName then Exit;
+  end;
+  Result := DataSet.FieldByName(AName);
+  AIdx := Result.Index + 1;
+end;
+
+// FDbf[dbShows].aFilterText, lower-cased - worked out again only when
+// aFilterText changes. aFilterText is set in several places, so this
+// notices the change itself rather than relying on each of them. While
+// it is unchanged, FShowsNeedleSrc shares its string, and comparing two
+// references to the same string returns at once without reading the text.
+function TForm1.ShowsNeedleLower: String;
+begin
+  if FShowsNeedleSrc <> FDbf[dbShows].aFilterText then
+  begin
+    FShowsNeedleSrc := FDbf[dbShows].aFilterText;
+    FShowsNeedleLo := UTF8LowerCase(FShowsNeedleSrc);
+  end;
+  Result := FShowsNeedleLo;
 end;
 
 // Packs the table, rebuilds the TITLE index, and reports the outcome.
@@ -6000,11 +6388,24 @@ begin
   // Speed up the scan
   //g.ExactFind := sb(['|', Trim(UTF8UpperCase(sFind)), '|']);
   g.ExactFind := sFind.Key; //standardize Title with KEY stringhelper
+  // Set once here; FilterShowsOnExactTitle used to set it for every record.
+  FDbf[dbShows].aFilterDescription := g.ExactFind;
   db.OnFilterRecord := @FilterShowsOnExactTitle;
   db.Filtered := True;
   DBFRecordCountChanged(db); // filter changed what ExactRecordCount reports
   db.First;
-  if db.ExactRecordCount = 1 then Result := GetShowsTitle;
+  // Exactly one match means a first one and no second. This stops at the
+  // second match instead of counting them all: ExactRecordCount walks
+  // the whole table through the filter, on every keystroke. After Next
+  // runs off the end, the one match is still the current record. (The
+  // extra scroll is cheap: the guard above has controls disabled, so
+  // SHOWS' scroll handlers return at once.)
+  if not db.EOF then
+  begin
+    Result := GetShowsTitle;
+    db.Next;
+    if not db.EOF then Result := '';
+  end;
   if Result <> '' then Exit;
   // This ensures the Grid is populated with all potential candidates
   // (Reacher, Preacher, etc) just in case we need to show the dialog.
@@ -6160,6 +6561,8 @@ end;
 procedure TForm1.FormCreate(Sender: TObject);
 begin
   FEpisodeMatcher := TEpisodeMatcher.Create;
+  FProbedSubTracks := TSubTracksMap.Create;
+  FProbedSubTracks.Sorted := True;
   FEpisodeMatcher.OnSanitizeFileName := @uUtils.FixWinFileName;
   // 150ms comfortably absorbs same-action multi-handler bursts (e.g. a
   // single keystroke firing KeyPress/KeyUp/Change in succession, or
@@ -6219,6 +6622,7 @@ begin
   // automatic cascade OR the later record Finalize to double-free.
   FSourceManager.Clear;
   FreeAndNil(FEpisodeMatcher);
+  FreeAndNil(FProbedSubTracks);
 end;
 
 procedure TForm1.FormDropFiles(Sender: TObject;
@@ -6401,6 +6805,11 @@ var
   s: String = '';
 begin
   s := ProbeFile(curFile);
+  // Kept for when this file is renamed, so FlushMKVEdits can set its
+  // subtitle flags without an mkvmerge run of its own.
+  if Assigned(FProbedSubTracks) and
+    (UTF8UpperCase(ExtractFileExt(curFile)) = '.MKV') then
+    FProbedSubTracks.KeyData[SubTracksKey(curFile)] := SubTracksFromProbe(s);
   db := FDbf[dbList].aDB;
   db.Edit;
   {checkdup prevents re-adding info that's already there}
@@ -6467,64 +6876,6 @@ begin
   Result := LUnz.QuickExtractToStream(LRes.Value, 'FILEY-SRC.ZIP',
     AMemoryTarget);
   if Assigned(Result) then Result.Position := 0;
-end;
-
-function TForm1.GetSubtitleTrackInfo(const AFilePath: String;
-  out AEnglishID: Integer): TSmartStrings;
-var
-  i, iExit, iID: Integer;
-  oJSON: TJSONData;
-  oRoot, oTrack, oProps: TJSONObject;
-  oTracks: TJSONArray;
-  sOutput, sLang, sLangIETF: String;
-begin
-  AEnglishID := -1;
-  if not EnsureMKVToolsAvailable(True, False) then Exit;
-
-  // Run mkvmerge once and capture its JSON track listing. RunCommand drains
-  // stdout as the child writes it, so there's no poUsePipes/poWaitOnExit
-  // deadlock risk here. A single invocation now serves both the full
-  // subtitle-track list and the first-English-track lookup, where
-  // previously each was fetched by a separate mkvmerge call.
-  sOutput := RunEx(g.FilePathMKVMerge.Value, ['-J', AFilePath], iExit);
-
-  // Don't gate on RunCommand's own boolean result: mkvmerge can exit
-  // with a nonzero status on warnings while still emitting valid JSON
-  // on stdout, so check the captured output itself instead.
-  if Trim(sOutput) = '' then Exit;
-
-  oJSON := GetJSON(sOutput);
-  try
-    if not (oJSON is TJSONObject) then Exit;
-    oRoot := TJSONObject(oJSON);
-    oTracks := oRoot.Get('tracks', TJSONArray(nil));
-    if not Assigned(oTracks) then Exit;
-
-    for i := 0 to oTracks.Count - 1 do
-    begin
-      oTrack := oTracks.Objects[i];
-      if oTrack.Get('type', '') <> 'subtitles' then Continue;
-
-      iID := oTrack.Get('id', -1);
-      Result.Value.Add(IntToStr(iID));
-
-      // Only the first matching English track is kept, mirroring the
-      // original GetFirstEngSubTrackID behaviour.
-      if AEnglishID = -1 then
-      begin
-        oProps := oTrack.Get('properties', TJSONObject(nil));
-        if Assigned(oProps) then
-        begin
-          sLang := oProps.Get('language', '');
-          sLangIETF := oProps.Get('language_ietf', '');
-          if (sLang = 'eng') or sLangIETF.StartsWith('en') then
-            AEnglishID := iID;
-        end;
-      end;
-    end;
-  finally
-    FreeAndNil(oJSON);
-  end;
 end;
 
 function TForm1.GetUndo: Boolean;
@@ -6598,53 +6949,137 @@ end;
 // The main import loop: walks CSVLines (skipping the header), appends
 // one aDB row per non-blank, well-formed line. Returns rows processed.
 // Honors cancel/shutdown by breaking early, same as before.
+const
+  // allshows.txt lines per ImportParseJob: enough that handing out a job
+  // costs nothing next to doing it, few enough that the work spreads
+  // evenly over the threads and the progress moves smoothly.
+  IMPORT_PARSE_CHUNK = 500;
+
+function TForm1.ImportCancelCheck: Boolean;
+begin
+  Result := g.IsProgressCanceled or FIsShuttingDown;
+end;
+
+// One chunk of allshows.txt's lines, parsed on a worker thread: the same
+// work the import loop used to do per line before appending its row, but
+// with a TStringList of its own and writing only to its own lines' entries
+// in FImportTitles/FImportDirs/FImportKeys/FImportUse. Nothing here
+// touches SHOWS.DBF or the LCL; DecodeHTMLEntities, Trim and
+// ShowsSearchKey (TMyStringHelper.Key) only work on the strings they're
+// given.
+procedure TForm1.ImportParseJob(AIndex: Integer);
+var
+  Fields: TStringList;
+  iFirst, iLast, iLine: Integer;
+  sLine, sTitle: String;
+begin
+  // Line 0 is the header.
+  iFirst := 1 + AIndex * IMPORT_PARSE_CHUNK;
+  iLast := Min(FImportTotal - 1, iFirst + IMPORT_PARSE_CHUNK - 1);
+  Fields := TStringList.Create;
+  try
+    Fields.StrictDelimiter := True;
+    Fields.Delimiter := ',';
+    for iLine := iFirst to iLast do
+    begin
+      sLine := FImportLines[iLine];
+      if not sLine.IsNotBlank then Continue;
+      Fields.DelimitedText := sLine;
+      if (Fields.Count < 3) or IsEmptyRecord(Fields) then Continue;
+      sTitle := DecodeHTMLEntities(Fields[0].Trim).Replace(#10, '');
+      FImportTitles[iLine] := sTitle;
+      FImportDirs[iLine] := Fields[1].Trim;
+      FImportKeys[iLine] := ShowsSearchKey(sTitle, FImportDirs[iLine]);
+      FImportUse[iLine] := True;
+    end;
+  finally
+    Fields.Free;
+  end;
+end;
+
+procedure TForm1.ImportParseProgress(ADone, ATotal: Integer);
+begin
+  if ATotal <= 0 then Exit;
+  ProgressLabel.Caption := Format('Reading shows list: %d%%',
+    [Round(ADone * 100 / ATotal)]);
+end;
+
+// Fills SHOWS.DBF from allshows.txt's lines (CSVLines, header first).
+// Returns rows added. Honors cancel/shutdown by stopping early.
+//
+// Two steps. First every line is parsed - split into fields, entities
+// decoded, search key built - side by side on worker threads
+// (ImportParseJob). Then the rows are appended to SHOWS.DBF here, on the
+// main thread, one after another as before: a .dbf has a single writer.
+// How much the first step saves depends on how the import's time divides
+// between the two; DebugLog reports both.
 function TForm1.ImportShowsRows(aDB: TDbf; const CSVLines: TSmartStrings;
   TotalLines: Integer; const StartTime: TDateTime): Integer;
 var
-  Fields: TSmartStrings; // RAII: For CSV line parsing
-  CurrentLine, UpdateCounter: Integer;
+  CurrentLine, iJobs, UpdateCounter: Integer;
   FldTitle, FldDir, FldSearch: TField; // looked up once, not per row
-  sTitle: String = '';
-  sDir: String = '';
+  ParseStart, WriteStart: QWord;
 const
   BATCH_SIZE = 250;
 begin
-  Fields.Setup(Self);
-  Fields.Value.StrictDelimiter := True;
-  Fields.Value.Delimiter := ',';
-  FldTitle := aDB.FieldByName('TITLE');
-  FldDir := aDB.FieldByName('DIRECTORY');
-  FldSearch := aDB.FieldByName('SEARCHTHIS');
-  CurrentLine := 1; // Skip header
   Result := 0;
-  UpdateCounter := 0;
-  while (CurrentLine < TotalLines) do
-  begin
-    if g.IsProgressCanceled or FIsShuttingDown then Break;
-    if CSVLines.Value[CurrentLine].IsNotBlank then
+  if TotalLines <= 1 then Exit;
+  FImportLines := CSVLines.Value;
+  FImportTotal := TotalLines;
+  FImportTitles := nil;
+  FImportDirs := nil;
+  FImportKeys := nil;
+  FImportUse := nil;
+  SetLength(FImportTitles, TotalLines);
+  SetLength(FImportDirs, TotalLines);
+  SetLength(FImportKeys, TotalLines);
+  SetLength(FImportUse, TotalLines);
+  try
+    // 1. Parse, in parallel.
+    ParseStart := GetTickCount64;
+    iJobs := (TotalLines - 1 + IMPORT_PARSE_CHUNK - 1) div IMPORT_PARSE_CHUNK;
+    RunParallel(iJobs, @ImportParseJob, ParallelThreadCount,
+      @ImportParseProgress, @ImportCancelCheck);
+    DebugLog(sb(['ImportShowsRows: parsed ', TotalLines - 1, ' lines in ',
+      GetTickCount64 - ParseStart, ' ms']));
+    if ImportCancelCheck then Exit;
+
+    // 2. Append, on the main thread.
+    WriteStart := GetTickCount64;
+    FldTitle := aDB.FieldByName('TITLE');
+    FldDir := aDB.FieldByName('DIRECTORY');
+    FldSearch := aDB.FieldByName('SEARCHTHIS');
+    CurrentLine := 1; // Skip header
+    UpdateCounter := 0;
+    while (CurrentLine < TotalLines) do
     begin
-      Fields.Value.DelimitedText := CSVLines.Value[CurrentLine];
-      if (Fields.Value.Count >= 3) and not IsEmptyRecord(Fields.Value) then
+      if g.IsProgressCanceled or FIsShuttingDown then Break;
+      if FImportUse[CurrentLine] then
       begin
-        // Compute once into locals; don't read back from the record buffer.
-        sTitle := DecodeHTMLEntities(Fields.Value[0].Trim).Replace(#10, '');
-        sDir := Fields.Value[1].Trim;
         aDB.Append;
-        FldTitle.AsString := sTitle;
-        FldDir.AsString := sDir;
-        FldSearch.AsString := ShowsSearchKey(sTitle, sDir);
+        FldTitle.AsString := FImportTitles[CurrentLine];
+        FldDir.AsString := FImportDirs[CurrentLine];
+        FldSearch.AsString := FImportKeys[CurrentLine];
         aDB.Post;
         Inc(Result);
         Inc(UpdateCounter);
       end;
+      Inc(CurrentLine);
+      if UpdateCounter >= BATCH_SIZE then
+      begin
+        ReportShowsImportProgress(CurrentLine, TotalLines, Result, StartTime);
+        UI.Check;
+        UpdateCounter := 0;
+      end;
     end;
-    Inc(CurrentLine);
-    if UpdateCounter >= BATCH_SIZE then
-    begin
-      ReportShowsImportProgress(CurrentLine, TotalLines, Result, StartTime);
-      UI.Check;
-      UpdateCounter := 0;
-    end;
+    DebugLog(sb(['ImportShowsRows: appended ', Result, ' rows in ',
+      GetTickCount64 - WriteStart, ' ms']));
+  finally
+    FImportLines := nil;
+    FImportTitles := nil;
+    FImportDirs := nil;
+    FImportKeys := nil;
+    FImportUse := nil;
   end;
 end;
 
@@ -6843,9 +7278,9 @@ begin
           Syn := TSynEdit(comp);
           // Keys: see WriteSourceCodeFont. Defaults are what
           // AddtsSourceCode already gave the editor.
-          Syn.Font.Name := ini.ReadString('Main', Page.Name + '.Font.Name',
+          Syn.Font.Name := ini.ReadString(INI_MAIN, Page.Name + '.Font.Name',
             Syn.Font.Name);
-          Syn.Font.Size := ini.ReadInteger('Main', Page.Name + '.Font.Size',
+          Syn.Font.Size := ini.ReadInteger(INI_MAIN, Page.Name + '.Font.Size',
             Syn.Font.Size);
         end;
     end;
@@ -6902,7 +7337,7 @@ end;
 // executable always matches the running build, where one extracted to
 // g.OpPath may be left over from an older one. False (and logged), with
 // AViewer left as it was, if the zip doesn't have ADoc.
-function TForm1.LoadBundledDoc(var AViewer: TSmartHtmlViewer;
+function TForm1.LoadBundledDoc(constref AViewer: TSmartHtmlViewer;
   const ADoc: String): Boolean;
 var
   MS: TSmartMemoryStream;
@@ -6945,19 +7380,19 @@ procedure TForm1.LoadConfiguration(ini: TIniFile);
   begin
     if Assigned(ini) then
     begin
-      bUseSavedNames := ini.ReadInteger('Main', 'FontSettingsVersion', 0) >=
-        FONT_SETTINGS_VERSION;
+      bUseSavedNames := ini.ReadInteger(INI_MAIN,
+        INI_KEY_FONT_SETTINGS_VERSION, 0) >= FONT_SETTINGS_VERSION;
       if bUseSavedNames then
       begin
-        sMain := ini.ReadString('Main', 'Self.Canvas.Font.Name', '');
-        sStatus := ini.ReadString('Main', 'StatusBar.Canvas.Font.Name', '');
+        sMain := ini.ReadString(INI_MAIN, INI_KEY_FORM_FONT_NAME, '');
+        sStatus := ini.ReadString(INI_MAIN, INI_KEY_STATUSBAR_FONT_NAME, '');
       end;
       // Sizes and Bold were never overwritten, so they're kept from any ini.
-      iMain := ini.ReadInteger('Main', 'Self.Canvas.Font.Size', iMain);
-      bMainBold := ini.ReadBool('Main', 'Self.Canvas.Font.Bold', bMainBold);
-      iStatus := ini.ReadInteger('Main', 'StatusBar.Canvas.Font.Size',
+      iMain := ini.ReadInteger(INI_MAIN, INI_KEY_FORM_FONT_SIZE, iMain);
+      bMainBold := ini.ReadBool(INI_MAIN, INI_KEY_FORM_FONT_BOLD, bMainBold);
+      iStatus := ini.ReadInteger(INI_MAIN, INI_KEY_STATUSBAR_FONT_SIZE,
         iStatus);
-      bStatusBold := ini.ReadBool('Main', 'StatusBar.Canvas.Font.Bold',
+      bStatusBold := ini.ReadBool(INI_MAIN, INI_KEY_STATUSBAR_FONT_BOLD,
         bStatusBold);
     end;
     // Same limits the Font dialog enforces (see SetupUI).
@@ -6979,31 +7414,25 @@ procedure TForm1.LoadConfiguration(ini: TIniFile);
 begin
   LoadFonts; // before the Exit below: the fonts need defaults regardless
   if not Assigned(ini) then Exit;
-  OpenDialog.InitialDir := ini.ReadString('Main', 'InitialDir', '');
+  OpenDialog.InitialDir := ini.ReadString(INI_MAIN, INI_KEY_INITIAL_DIR, '');
   Self.AutoSize := False; // Must be FALSE to restore window bounds
   SetBounds(Self,
-    ini.ReadInteger('Main', 'Left', 530),
-    ini.ReadInteger('Main', 'Top', 200),
-    ini.ReadInteger('Main', 'Width', 846),
-    ini.ReadInteger('Main', 'Height', 570));
+    ini.ReadInteger(INI_MAIN, INI_KEY_LEFT, 530),
+    ini.ReadInteger(INI_MAIN, INI_KEY_TOP, 200),
+    ini.ReadInteger(INI_MAIN, INI_KEY_WIDTH, 846),
+    ini.ReadInteger(INI_MAIN, INI_KEY_HEIGHT, 570));
   g.IsHideRenamedCount := False;
 
   g.IsHideSelectAShow := False;
   // CheckResourceFiles used to run here, inside the constructor, before the
   // form had been drawn. It now runs from DeferredStartup.
   g.IsCreateDesktopShortcut :=
-    ini.ReadBool('Main', 'IsCreateDesktopShortcut', True);
-  g.IsCreateMenuEntry := ini.ReadBool('Main', 'IsCreateMenuEntry', True);
-  g.IsAskMoveAppImage := ini.ReadBool('Main', 'AskMoveAppImage', True);
-  // Anything but the other value means the default.
-  if SameText(Trim(ini.ReadString('Main', 'ReservedCharacters', '')),
-    'underscore') then g.ReservedCharStyle := rcsUnderscore
-  else
-    g.ReservedCharStyle := rcsLookalike;
-  if SameText(Trim(ini.ReadString('Main', 'WordSeparator', '')), 'dot') then
-    g.WordSeparator := wsDot
-  else
-    g.WordSeparator := wsSpace;
+    ini.ReadBool(INI_MAIN, INI_KEY_CREATE_DESKTOP_SHORTCUT, True);
+  g.IsCreateMenuEntry := ini.ReadBool(INI_MAIN, INI_KEY_CREATE_MENU_ENTRY,
+    True);
+  g.IsAskMoveAppImage := ini.ReadBool(INI_MAIN, INI_KEY_ASK_MOVE_APPIMAGE,
+    True);
+  ReadNameStyle(ini);
 end;
 
 function TForm1.LoadResourceToString(const ResourceName: String): String;
@@ -7290,7 +7719,7 @@ begin
   ShowMessage(sResult);
 end;
 
-procedure TForm1.MessageRenamedCount(var Op: TRenameOperationState);
+procedure TForm1.MessageRenamedCount(const Op: TRenameOperationState);
 var
   s: String = '';
   sResult: String;
@@ -7342,19 +7771,10 @@ begin
     else
       Exit;
   end;
-  FNameStyleItems[NAME_STYLE_RESERVED_LOOKALIKE].Checked :=
-    g.ReservedCharStyle = rcsLookalike;
-  FNameStyleItems[NAME_STYLE_RESERVED_UNDERSCORE].Checked :=
-    g.ReservedCharStyle = rcsUnderscore;
-  FNameStyleItems[NAME_STYLE_SPACES].Checked := g.WordSeparator = wsSpace;
-  FNameStyleItems[NAME_STYLE_DOTS].Checked := g.WordSeparator = wsDot;
+  SyncNameStyleChecks;
   // Saved now, not only on exit, so a crash doesn't lose the choice.
-  if not g.IsIniFileDeleted then
   try
-    AppIni.Value.WriteString('Main', 'ReservedCharacters',
-      IfThen(g.ReservedCharStyle = rcsUnderscore, 'underscore', 'lookalike'));
-    AppIni.Value.WriteString('Main', 'WordSeparator',
-      IfThen(g.WordSeparator = wsDot, 'dot', 'space'));
+    WriteNameStyle(AppIni.Value);
   except
     on E: Exception do LogError('NameStyleMenuClick: could not save', E);
   end;
@@ -7637,7 +8057,16 @@ begin
   StatusBar.Panels[0].Text :=
     sb(['Processing ', ns(TotalCount), ' files...']);
   UI.Check;
-  ParsePass;
+  // Every video file's ffprobe at once, so ParsePass doesn't wait for
+  // them one after another. The results are only for ParsePass, and are
+  // thrown away as soon as it's done, on every path.
+  try
+    PrefetchProbes;
+    ParsePass;
+  finally
+    FreeAndNil(FProbePaths);
+    SetLength(FProbeOutputs, 0);
+  end;
   actLookupEpsExecute(Form1);
   AssignRootNameToAssociatedFiles;
   SetListTextWidth;
@@ -7710,7 +8139,9 @@ begin
       end;
     end;
   end;
-  Client.Get(g.URL, s);
+  // Fetched ahead, along with the other shows' pages, if this lookup spans
+  // several shows (StartEpsPrefetch); otherwise fetched now.
+  if not TakePrefetchedEpsPage(g.URL, s) then Client.Get(g.URL, s);
   if s.IsEmpty then Exit;
   Memo1.Lines.BeginUpdate;
   // this crazyness weeds out html pages which don't conform to what's expected
@@ -7798,7 +8229,11 @@ begin
   // Only process video and subtitle files
   if (IndexStr(sUpExt, Subtitle_Extensions) < 0) and not
     (Video_File_Extensions.Value.Find(sUpExt, IndexOf)) then Exit;
-  GetMKVAttributes(curFile);
+  // Video files only: an associated file's name comes from its video
+  // file's (AssignRootNameToAssociatedFiles), so what ffprobe says about a
+  // subtitle file was never used - it only cost a process start (through
+  // Wine, for the bundled ffprobe.exe on Linux).
+  if GetListTreeLevel = '0' then GetMKVAttributes(curFile);
   Match := FEpisodeMatcher.GetEpNumName(curFile);
   if Match.Found then
   begin
@@ -7911,7 +8346,7 @@ begin
   if g.WasSelected then OfferRenameDeepestDir;
 end;
 
-procedure TForm1.PostRecord(var aDB: TDbf);
+procedure TForm1.PostRecord(const aDB: TDbf);
 var
   bReadOnly: Boolean = False;
 begin
@@ -7968,6 +8403,282 @@ begin
   end;
 end;
 
+// Runs ffprobe on every video file in LIST at once - several at a time,
+// on background threads (uUtils.RunExBatchAndWait) - before
+// ParseFilesList's parse pass, which then finds each result waiting in
+// ProbeFile instead of starting ffprobe itself and waiting for it, one
+// file after another.
+//
+// Only the ffprobe processes run in the background. LIST is read here and
+// written by GetMKVAttributes on the main thread, as before.
+//
+// Subtitle and other associated files aren't probed: their names come
+// from their video file's (AssignRootNameToAssociatedFiles), so nothing
+// ffprobe could say about them is used. ParseTitleNEpNum skips them too.
+procedure TForm1.PrefetchProbes;
+var
+  Commands: array of String;
+  db: TDbf;
+  ExitCodes: TIntegerArray;
+  i: Integer;
+
+  // Its own routine so the guard (which disables LIST's controls and puts
+  // the cursor back) is released before the wait below pumps messages.
+  procedure CollectVideoFiles;
+  var
+    Guard: TDataLayoutGuard;
+    iExt: Integer = 0;
+    sFile: String;
+  begin
+    Guard := TDataLayoutGuard.Create(db);
+    db.First;
+    while not db.EOF do
+    begin
+      // The same string ParsePass will hand ParseTitleNEpNum, and so
+      // ProbeFile: FROM still holds the full path at this point.
+      sFile := GetListFrom;
+      if sFile.IsNotEmpty and Video_File_Extensions.Value.Find(
+        UTF8UpperCase(ExtractFileExt(sFile)), iExt) and
+        (FProbePaths.IndexOf(sFile) < 0) then
+        FProbePaths.Add(sFile);
+      db.Next;
+    end;
+  end;
+
+begin
+  FreeAndNil(FProbePaths);
+  FProbeOutputs := nil;
+  if FIsShuttingDown then Exit;
+  db := FDbf[dbList].aDB;
+  if not (Assigned(db) and db.Active) then Exit;
+  FProbePaths := TStringList.Create;
+  // Unsorted, so each path's index stays its command's index. Exact
+  // matches only: the very same strings are looked up again in ProbeFile.
+  FProbePaths.CaseSensitive := True;
+  CollectVideoFiles;
+  if FProbePaths.Count = 0 then Exit;
+  if not EnsureToolAvailable(g.FilePathFFProbe, g.WineFFProbe,
+    'ffprobe', 'ffprobe.exe', '-version') then
+  begin
+    FreeAndNil(FProbePaths);
+    Exit;
+  end;
+  Commands := nil;
+  SetLength(Commands, FProbePaths.Count);
+  for i := 0 to FProbePaths.Count - 1 do
+    Commands[i] := ProbeCommandLine(FProbePaths[i]);
+  ProbeProgress(0, FProbePaths.Count);
+  // Each ffprobe is mostly waiting on the disk and on process start-up
+  // (Wine's, for the bundled Windows build on Linux), so a few more than
+  // the processor count still helps - but not so many that a spinning disk
+  // thrashes between files. If ffprobe hangs, RunExBatchAndWait stops
+  // waiting after two minutes without a result; whatever is missing is
+  // then probed one at a time by ProbeFile, as before.
+  // The wait is deliberately not cut short by FIsShuttingDown: it is
+  // only a few seconds, and AddFiles' FIsScanning gate keeps a second drop
+  // out meanwhile.
+  RunExBatchAndWait(Commands, [], FProbeOutputs, ExitCodes,
+    ParallelThreadCount, True, @ProbeProgress);
+end;
+
+// ---------------------------------------------------------------------------
+// Episode-list pages fetched ahead, for a lookup across several shows.
+//
+// actLookupEpsExecute looks episodes up one file at a time, and the first
+// file of each show (not already looked up today) waits while DownLoadEps
+// fetches that show's epguides page. With several shows in one batch,
+// StartEpsPrefetch starts all their pages downloading at once, in the
+// background (uBrowser's download threads), before the lookup begins;
+// ParseHTMLToMemo then takes each page from here (TakePrefetchedEpsPage)
+// instead of fetching it itself. With just one show there's nothing to
+// overlap, so nothing is fetched ahead and nothing changes.
+//
+// The shows are only guessed here - an exact match of the title parsed
+// from each file name, the first step PerformTitleLookup tries. A file
+// whose show takes more than that (episode name, year, folder name, or
+// asking) still gets its page the usual way when it comes to it; a page
+// fetched for a wrong guess is simply never used. No table is touched
+// from a background thread: the downloads only fill memory.
+// ---------------------------------------------------------------------------
+
+procedure TForm1.StartEpsPrefetch;
+var
+  Counts: TIntegerArray;
+  Dates, Dirs: TStringArray;
+  i: Integer;
+  Keys, URLs: TStringList;
+  sURL: String;
+
+  // The distinct title keys still to be looked up: LIST's video files
+  // without a new name yet.
+  procedure CollectTitleKeys;
+  var
+    db: TDbf;
+    Guard: TDataLayoutGuard;
+    sKey: String;
+  begin
+    db := FDbf[dbList].aDB;
+    if not (Assigned(db) and db.Active) then Exit;
+    Guard := TDataLayoutGuard.Create(db);
+    db.First;
+    while not db.EOF do
+    begin
+      if (GetListTreeLevel = '0') and GetListTo.IsEmpty then
+      begin
+        sKey := GetListTitle.Key;
+        if sKey.IsNotEmpty then Keys.Add(sKey);
+      end;
+      db.Next;
+    end;
+  end;
+
+  // One pass over SHOWS.DBF for all the keys at once, counting matches the
+  // way FindMyTitle's exact step does (FilterShowsOnExactTitle: the key
+  // anywhere in SEARCHTHIS) and keeping the first match's directory and
+  // LOOKUPDATE. SHOWS' filter and position are put back afterwards.
+  procedure ScanShows;
+  var
+    bWasFiltered: Boolean;
+    db: TDbf;
+    FldDate, FldDir, FldSearch: TField;
+    Guard: TDataLayoutGuard;
+    k: Integer;
+    OldOnFilter: TFilterRecordEvent;
+    sSearch: String;
+  begin
+    db := FDbf[dbShows].aDB;
+    if not (Assigned(db) and db.Active) then Exit;
+    Guard := TDataLayoutGuard.Create(db);
+    bWasFiltered := db.Filtered;
+    OldOnFilter := db.OnFilterRecord;
+    try
+      db.Filtered := False;
+      FldSearch := db.FieldByName('SEARCHTHIS');
+      FldDir := db.FieldByName('DIRECTORY');
+      FldDate := db.FieldByName('LOOKUPDATE');
+      db.First;
+      while not db.EOF do
+      begin
+        if FIsShuttingDown then Exit;
+        sSearch := FldSearch.AsString;
+        for k := 0 to Keys.Count - 1 do
+          if UTF8ContainsText(sSearch, Keys[k]) then
+          begin
+            Inc(Counts[k]);
+            if Counts[k] = 1 then
+            begin
+              Dirs[k] := Trim(FldDir.AsString);
+              Dates[k] := Trim(FldDate.AsString);
+            end;
+          end;
+        db.Next;
+      end;
+    finally
+      db.OnFilterRecord := OldOnFilter;
+      db.Filtered := bWasFiltered;
+      DBFRecordCountChanged(db);
+    end;
+  end;
+
+begin
+  StopEpsPrefetch;
+  if FIsShuttingDown or not g.IsInternetConnected or
+    not BrowserThreadsAvailable then Exit;
+  Keys := TStringList.Create;
+  URLs := TStringList.Create;
+  try
+    Keys.Sorted := True;
+    Keys.Duplicates := dupIgnore;
+    Keys.CaseSensitive := True;
+    CollectTitleKeys;
+    // One show (the usual case): nothing to overlap.
+    if Keys.Count < 2 then Exit;
+    Counts := nil;
+    Dirs := nil;
+    Dates := nil;
+    SetLength(Counts, Keys.Count);
+    SetLength(Dirs, Keys.Count);
+    SetLength(Dates, Keys.Count);
+    ScanShows;
+    if FIsShuttingDown then Exit;
+    // DownLoadEps' own rules: the page for a show found exactly once, not
+    // already fetched today, at the same address DownLoadEps builds.
+    URLs.CaseSensitive := True;
+    for i := 0 to Keys.Count - 1 do
+      if (Counts[i] = 1) and Dirs[i].IsNotEmpty and (Dates[i] <> g.Today) then
+      begin
+        sURL := g.EpGuidesURL + Dirs[i] + '/';
+        if URLs.IndexOf(sURL) < 0 then URLs.Add(sURL);
+      end;
+    if URLs.Count < 2 then Exit;
+    if not InitializeShowsDownloadSSL then Exit;
+    DebugLog(sb(['StartEpsPrefetch: fetching ', URLs.Count,
+      ' episode pages ahead: ', URLs.CommaText]));
+    FEpsPrefetch := TBrowserDownloadBatch.Create(URLs, True);
+    FEpsPrefetchURLs := URLs;
+    URLs := nil; // FEpsPrefetchURLs owns it now
+    StartBrowserDownloads(FEpsPrefetch, Min(4, FEpsPrefetchURLs.Count));
+  finally
+    Keys.Free;
+    URLs.Free;
+  end;
+end;
+
+// Stops any downloads still under way and lets the batch go. A download
+// thread still finishing a request holds its own reference, so the batch
+// outlives this until that thread is done.
+procedure TForm1.StopEpsPrefetch;
+begin
+  if Assigned(FEpsPrefetch) then
+  begin
+    FEpsPrefetch.Cancel;
+    FEpsPrefetch.Release;
+    FEpsPrefetch := nil;
+  end;
+  FreeAndNil(FEpsPrefetchURLs);
+end;
+
+// AURL's page if StartEpsPrefetch fetched it, waiting (window responsive)
+// for it if it's still on its way. False if it wasn't fetched ahead, or
+// failed - ParseHTMLToMemo then fetches it itself, as before. AContent
+// gets the page's bytes exactly as TFPHTTPClient.Get would return them.
+function TForm1.TakePrefetchedEpsPage(const AURL: String;
+  out AContent: String): Boolean;
+const
+  WAIT_MAX_MS = 30000;
+var
+  i: Integer;
+  Item: TBrowserDownload;
+  Start: QWord;
+begin
+  Result := False;
+  AContent := '';
+  if not (Assigned(FEpsPrefetch) and Assigned(FEpsPrefetchURLs)) then Exit;
+  i := FEpsPrefetchURLs.IndexOf(AURL);
+  if i < 0 then Exit;
+  Start := GetTickCount64;
+  while (FEpsPrefetch.Finished(i) = nil) and not FEpsPrefetch.AllDone do
+  begin
+    if FIsShuttingDown or (GetTickCount64 - Start >= WAIT_MAX_MS) then Exit;
+    Application.ProcessMessages;
+    Sleep(10);
+  end;
+  Item := FEpsPrefetch.Finished(i);
+  if not (Assigned(Item) and Item.OK) then
+  begin
+    if Assigned(Item) then
+      DebugLog(sb(['TakePrefetchedEpsPage: ', AURL, ' failed (',
+        Item.ErrorText, '); fetching it again']));
+    Exit;
+  end;
+  SetLength(AContent, Length(Item.Data));
+  if Length(Item.Data) > 0 then
+    Move(Item.Data[1], AContent[1], Length(Item.Data));
+  DebugLog(sb(['TakePrefetchedEpsPage: ', AURL, ' (', Length(AContent),
+    ' bytes, fetched ahead)']));
+  Result := True;
+end;
+
 // Clears out the old rows and drops the TITLE index before the bulk load,
 // so uniqueness isn't re-checked on every single Append/Post.
 procedure TForm1.PrepareShowsTableForImport(aDB: TDbf);
@@ -7982,17 +8693,46 @@ begin
   DeleteIndexIfPresentExclusive(aDB, 'TITLE');
 end;
 
+// PrefetchProbes' progress, as each file's ffprobe finishes.
+procedure TForm1.ProbeProgress(ADone, ATotal: Integer);
+begin
+  if FIsShuttingDown then Exit;
+  StatusBar.Panels[0].Text :=
+    sb(['Reading file details: ', ADone, ' of ', ATotal, '...']);
+end;
+
+// The ffprobe command for one file. The caller has already checked
+// (EnsureToolAvailable) that ffprobe is there.
+function TForm1.ProbeCommandLine(const sFind: String): String;
+begin
+  Result := sb([g.WineFFProbe, g.FilePathFFProbe.Value,
+    ' -v quiet -show_format -show_streams "', sFind, '"']);
+end;
+
 function TForm1.ProbeFile(const sFind: String): String;
 var
-  sCommandLine: String = '';
+  i: Integer;
 begin
   Result := '';
   if sFind.IsEmpty then Exit;
+  // Already probed by PrefetchProbes, during ParseFilesList's parse pass.
+  if Assigned(FProbePaths) then
+  begin
+    i := FProbePaths.IndexOf(sFind);
+    // An empty result - ffprobe failed, or PrefetchProbes stopped waiting
+    // before this file came back - is probed again below, one at a time,
+    // exactly as before PrefetchProbes existed.
+    if (i >= 0) and (i <= High(FProbeOutputs)) and
+      (FProbeOutputs[i] <> '') then
+    begin
+      Result := FProbeOutputs[i];
+      DebugLog('Probefile (prefetched) ' + sFind + ' = ' + Result);
+      Exit;
+    end;
+  end;
   if not EnsureToolAvailable(g.FilePathFFProbe, g.WineFFProbe,
     'ffprobe', 'ffprobe.exe', '-version') then Exit;
-  sCommandLine := sb([g.WineFFProbe, g.FilePathFFProbe.Value,
-    ' -v quiet -show_format -show_streams "', sFind, '"']);
-  Result := RunEx(sCommandLine, True);
+  Result := RunEx(ProbeCommandLine(sFind), True);
   DebugLog('Probefile ' + sFind + ' = ' + Result);
 end;
 
@@ -8172,8 +8912,8 @@ var
 
 begin
   if FSearchKeysCurrent then Exit;
-  if Assigned(AppIni.Value) and (AppIni.Value.ReadInteger('Main',
-    'SearchKeyVersion', 1) >= SEARCH_KEY_VERSION) then
+  if Assigned(AppIni.Value) and (AppIni.Value.ReadInteger(INI_MAIN,
+    INI_KEY_SEARCH_KEY_VERSION, 1) >= SEARCH_KEY_VERSION) then
   begin
     FSearchKeysCurrent := True;
     Exit;
@@ -8280,7 +9020,7 @@ function TForm1.RenameListItem(const aDB: TDbf;
 var
   IsMKV: Boolean;
   LLastError: Integer = 0;
-  s, sCommandLine, sFullFrom, sGroup, sOriginalDir, sTagFile: String;
+  s, sFullFrom, sOriginalDir: String;
 begin
   DebugLog('RenameListitem');
   Result := False;
@@ -8327,33 +9067,15 @@ begin
     // try block reported SetCurrentDir's result, not the failed rename's.
     if not Result then LLastError := GetLastOSError;
 
-    // 3.4 Clear old subtitle flags and force English subtitles in MKV files
+    // 3.5 An mkv file gets its subtitle flags (the English track made
+    // the default, forced one), its title and - if one can be guessed
+    // from the ORIGINAL name - its release group. Queued here and done
+    // for the whole rename run at once, side by side, when the run ends
+    // (FlushMKVEdits); straight away outside one.
     IsMKV := UTF8UpperCase(ExtractFileExt(Op.sTo)) = '.MKV';
-    if Result and IsMKV then ApplySubtitleFlags(Op.sTo);
-
-    // 3.5 Embed title (and, if one can be guessed from the ORIGINAL name,
-    // the release group) into mkv files
-    if Result and IsMKV and EnsureMKVToolsAvailable(False, True) then
-    begin
-      sCommandLine :=
-        sb([g.WineMKVPropEdit + g.FilePathMKVPropEdit.Value,
-        Space, Op.sTo.Quote, ' -e info -s ', ('title=' + Op.sTo).Quote]);
-      sGroup := GuessReleaseGroup(Op.From);
-      sTagFile := '';
-      if sGroup.IsNotEmpty then
-      begin
-        sTagFile := CombinePath(g.OpPath.Value, 'release_group_tags.xml');
-        if WriteReleaseGroupTagsFile(sGroup, sTagFile) then
-          sCommandLine := sb([sCommandLine, ' --tags ',
-            ('global:' + sTagFile).Quote])
-        else
-          sTagFile := '';
-      end;
-      RunEx(sCommandLine, True);
-      if sTagFile.IsNotEmpty then DeleteIfExists(sTagFile);
-      DebugLog(sb(['RenameListItem: release group for ', Op.From,
-        ' = "', sGroup, '"']));
-    end;
+    if Result and IsMKV then
+      QueueMKVEdit(Op.FromPath.Value, Op.sTo, Op.From,
+        TakeProbedSubTracks(sFullFrom));
 
   finally
     SetCurrentDir(sOriginalDir); //restore dir
@@ -8405,6 +9127,7 @@ var
   i: Integer;
   Op: TRenameOperationState;
   PendingDeletes: array of TBookmark;
+  bMKVBatchOpen: Boolean;
 begin
   // Guard against re-entrancy: MessageDlgEx pumps the message queue while
   // this runs, so a second trigger of the Rename action (or the Undo
@@ -8418,8 +9141,13 @@ begin
   if FIsRenaming then Exit;
   Op := Default(TRenameOperationState);  //freshly zeroed, every time
   FIsRenaming := True;
+  bMKVBatchOpen := False;
   try
     Busy := TSmartBusyState.Start(Form1, nil, StatusBar, True);
+    // Renamed MKV files are queued (RenameListItem) and given their
+    // subtitle flags, titles and tags together once the loop is done.
+    BeginMKVBatch;
+    bMKVBatchOpen := True;
     SetLength(PendingDeletes, 0);
     aDB.First;
     Op.CopiedCount := 0;
@@ -8496,6 +9224,9 @@ begin
       aDB.GotoBookmark(PendingDeletes[i]);
       aDB.Delete;
     end;
+    // Every queued MKV, at once, before the count is reported.
+    bMKVBatchOpen := False;
+    EndMKVBatch;
     MessageRenamedCount(Op);
     if (Op.CurDB = 'LOG.DBF') then
     begin
@@ -8508,6 +9239,10 @@ begin
       DBFRecordCountChanged(aDB);
     end;
   finally
+    // An exception (or Cancel's Break) still leaves the files renamed so
+    // far, and they still get their MKV edits - before FIsRenaming opens
+    // the gate again, since FlushMKVEdits pumps messages.
+    if bMKVBatchOpen then EndMKVBatch;
     FIsRenaming := False;
   end;
 end;
@@ -8710,39 +9445,38 @@ begin
   bWasCaching := ini.CacheUpdates;
   ini.CacheUpdates := True;
   try
-    ini.WriteBool('Main', 'IsCreateDesktopShortcut',
+    ini.WriteBool(INI_MAIN, INI_KEY_CREATE_DESKTOP_SHORTCUT,
       g.IsCreateDesktopShortcut);
-    ini.WriteBool('Main', 'IsCreateMenuEntry', g.IsCreateMenuEntry);
-    ini.WriteBool('Main', 'AskMoveAppImage', g.IsAskMoveAppImage);
-    ini.WriteString('Main', 'ReservedCharacters',
-      IfThen(g.ReservedCharStyle = rcsUnderscore, 'underscore', 'lookalike'));
-    ini.WriteString('Main', 'WordSeparator',
-      IfThen(g.WordSeparator = wsDot, 'dot', 'space'));
+    ini.WriteBool(INI_MAIN, INI_KEY_CREATE_MENU_ENTRY, g.IsCreateMenuEntry);
+    ini.WriteBool(INI_MAIN, INI_KEY_ASK_MOVE_APPIMAGE, g.IsAskMoveAppImage);
+    WriteNameStyle(ini);
     // FileName is empty if nothing has been opened or dropped this run;
     // keep the folder the dialog last started in rather than writing ''.
     if OpenDialog.FileName <> '' then
-      ini.WriteString('Main', 'InitialDir',
+      ini.WriteString(INI_MAIN, INI_KEY_INITIAL_DIR,
         ExtractFileDir(OpenDialog.FileName))
     else if OpenDialog.InitialDir <> '' then
-      ini.WriteString('Main', 'InitialDir', OpenDialog.InitialDir);
-    ini.WriteInteger('Main', 'Height', Self.Height);
-    ini.WriteInteger('Main', 'Left', Self.Left);
-    ini.WriteInteger('Main', 'Top', Self.Top);
-    ini.WriteInteger('Main', 'Width', Self.Width);
-    ini.WriteInteger('Main', 'FontSettingsVersion', FONT_SETTINGS_VERSION);
-    ini.WriteInteger('Main', 'IniVersion', INI_VERSION);
+      ini.WriteString(INI_MAIN, INI_KEY_INITIAL_DIR, OpenDialog.InitialDir);
+    ini.WriteInteger(INI_MAIN, INI_KEY_HEIGHT, Self.Height);
+    ini.WriteInteger(INI_MAIN, INI_KEY_LEFT, Self.Left);
+    ini.WriteInteger(INI_MAIN, INI_KEY_TOP, Self.Top);
+    ini.WriteInteger(INI_MAIN, INI_KEY_WIDTH, Self.Width);
+    ini.WriteInteger(INI_MAIN, INI_KEY_FONT_SETTINGS_VERSION,
+      FONT_SETTINGS_VERSION);
+    ini.WriteInteger(INI_MAIN, INI_KEY_INI_VERSION, INI_VERSION);
     // Only when known: a read-only SHOWS.DBF that couldn't be refreshed
     // keeps the older version, so the refresh runs once it can.
     if FSearchKeysCurrent then
-      ini.WriteInteger('Main', 'SearchKeyVersion', SEARCH_KEY_VERSION);
+      ini.WriteInteger(INI_MAIN, INI_KEY_SEARCH_KEY_VERSION,
+        SEARCH_KEY_VERSION);
     f := Self.Canvas.Font;
-    ini.WriteString('Main', 'Self.Canvas.Font.Name', f.Name);
-    ini.WriteInteger('Main', 'Self.Canvas.Font.Size', f.Size);
-    ini.WriteBool('Main', 'Self.Canvas.Font.Bold', f.Bold);
+    ini.WriteString(INI_MAIN, INI_KEY_FORM_FONT_NAME, f.Name);
+    ini.WriteInteger(INI_MAIN, INI_KEY_FORM_FONT_SIZE, f.Size);
+    ini.WriteBool(INI_MAIN, INI_KEY_FORM_FONT_BOLD, f.Bold);
     f := StatusBar.Canvas.Font;
-    ini.WriteString('Main', 'StatusBar.Canvas.Font.Name', f.Name);
-    ini.WriteInteger('Main', 'StatusBar.Canvas.Font.Size', f.Size);
-    ini.WriteBool('Main', 'StatusBar.Canvas.Font.Bold', f.Bold);
+    ini.WriteString(INI_MAIN, INI_KEY_STATUSBAR_FONT_NAME, f.Name);
+    ini.WriteInteger(INI_MAIN, INI_KEY_STATUSBAR_FONT_SIZE, f.Size);
+    ini.WriteBool(INI_MAIN, INI_KEY_STATUSBAR_FONT_BOLD, f.Bold);
     // (PageControlSourceCode.PageCount, once written here, was never read:
     // UpgradeIniFile removes it from older inis.)
     for i := 0 to pcSourceCode.PageCount - 1 do SaveTabFonts(i);
@@ -8846,7 +9580,8 @@ begin
   // records the version on exit instead.
   if g.IsIniFileDeleted or not AppIni.Exists then Exit;
   try
-    AppIni.Value.WriteInteger('Main', 'SearchKeyVersion', SEARCH_KEY_VERSION);
+    AppIni.Value.WriteInteger(INI_MAIN, INI_KEY_SEARCH_KEY_VERSION,
+      SEARCH_KEY_VERSION);
   except
     // A read-only or locked ini: the refresh just runs again next time.
     on E: Exception do
@@ -9505,13 +10240,73 @@ begin
   FNameStyleItems[NAME_STYLE_DOTS] := AddItem(Sub,
     'Words separated by dots:  Show.S01E01.Episode.Name.1080p.mkv',
     NAME_STYLE_DOTS, 2);
+  // LoadConfiguration (ReadNameStyle) ran before SetupUI, so these show
+  // what the ini held.
+  SyncNameStyleChecks;
+  MenuItem1.Insert(MenuItemSeparator.MenuIndex, Sub);
+end;
+
+// [Main] ReservedCharacters / WordSeparator into g. Anything unrecognised
+// - missing, misspelt, or written by a newer build - means the default,
+// the first value of each type.
+procedure TForm1.ReadNameStyle(ini: TIniFile);
+var
+  rcs: TReservedCharStyle;
+  ws: TWordSeparator;
+  sValue: String;
+begin
+  g.ReservedCharStyle := Low(TReservedCharStyle);
+  g.WordSeparator := Low(TWordSeparator);
+  if not Assigned(ini) then Exit;
+  sValue := Trim(ini.ReadString(INI_MAIN, INI_KEY_RESERVED_CHARACTERS, ''));
+  for rcs := Low(TReservedCharStyle) to High(TReservedCharStyle) do
+    if UTF8CompareText(sValue, RESERVED_CHAR_INI_VALUES[rcs]) = 0 then
+    begin
+      g.ReservedCharStyle := rcs;
+      Break;
+    end;
+  sValue := Trim(ini.ReadString(INI_MAIN, INI_KEY_WORD_SEPARATOR, ''));
+  for ws := Low(TWordSeparator) to High(TWordSeparator) do
+    if UTF8CompareText(sValue, WORD_SEPARATOR_INI_VALUES[ws]) = 0 then
+    begin
+      g.WordSeparator := ws;
+      Break;
+    end;
+end;
+
+// The submenu's radio items from g. A no-op until SetupNameStyleMenu has
+// made them.
+procedure TForm1.SyncNameStyleChecks;
+begin
+  if not Assigned(FNameStyleItems[NAME_STYLE_RESERVED_LOOKALIKE]) then Exit;
   FNameStyleItems[NAME_STYLE_RESERVED_LOOKALIKE].Checked :=
     g.ReservedCharStyle = rcsLookalike;
   FNameStyleItems[NAME_STYLE_RESERVED_UNDERSCORE].Checked :=
     g.ReservedCharStyle = rcsUnderscore;
   FNameStyleItems[NAME_STYLE_SPACES].Checked := g.WordSeparator = wsSpace;
   FNameStyleItems[NAME_STYLE_DOTS].Checked := g.WordSeparator = wsDot;
-  MenuItem1.Insert(MenuItemSeparator.MenuIndex, Sub);
+end;
+
+// g's name style into the ini. Both keys go out in one write of the file:
+// with CacheUpdates off, TIniFile rewrites the whole file per key, and
+// turning caching back off is what flushes it. Inside SaveConfiguration
+// caching is already on, so this leaves the flush to its UpdateFile.
+// Does nothing once the ini has been deleted from the menu.
+procedure TForm1.WriteNameStyle(ini: TIniFile);
+var
+  bWasCaching: Boolean;
+begin
+  if g.IsIniFileDeleted or not Assigned(ini) then Exit;
+  bWasCaching := ini.CacheUpdates;
+  ini.CacheUpdates := True;
+  try
+    ini.WriteString(INI_MAIN, INI_KEY_RESERVED_CHARACTERS,
+      RESERVED_CHAR_INI_VALUES[g.ReservedCharStyle]);
+    ini.WriteString(INI_MAIN, INI_KEY_WORD_SEPARATOR,
+      WORD_SEPARATOR_INI_VALUES[g.WordSeparator]);
+  finally
+    ini.CacheUpdates := bWasCaching;
+  end;
 end;
 
 // The Readme tab's Back button, made here rather than in uMain.lfm so the
@@ -9764,16 +10559,6 @@ begin
   Application.ProcessMessages;
 end;
 
-procedure TForm1.ShowMessageList(var aList: TStringList);
-var
-  s: String;
-  sResult: String;
-begin
-  sResult := '';
-  for s in aList do sb(sResult, [s, LE]);
-  ShowMessage(sResult);
-end;
-
 // Loads ADoc (a README_DOCS name) into vwReadme, scrolled to AAnchor when
 // that names a place in it, otherwise to APosition. False, with the page
 // on show left as it was, if this build doesn't carry ADoc.
@@ -9844,10 +10629,18 @@ end;
 procedure TForm1.ShowStatusDBF(aDbType: TDbType);
 var
   db: TDbf;
+  OnView: TDbType;
   sHint: String;
 begin
   db := FDbf[aDbType].aDB;
-  if tsSourceCode.Showing then Exit;
+  // Only the table on view may write the bar. This was
+  // "if tsSourceCode.Showing then Exit", but a notebook page's Showing
+  // doesn't reliably follow which page is on view, so after a visit to the
+  // Source Code tab it could stay True: every table was then shut out, and
+  // the editor's READ-ONLY badge stayed on the bar over AllShows. It also
+  // stops a table that merely scrolled in the background (EPS following
+  // SHOWS, a bulk loop) from replacing the status of the page on view.
+  if not (StatusBarDbType(OnView) and (OnView = aDbType)) then Exit;
   if not (Assigned(db) and db.Active) then Exit;
   // GetDBStatus below calls aDB.ExactRecordCount (via the aCachedRecCount/
   // aRecCountDirty cache on FDbf[ADbType] - see uDBF.TDBRecord), which for
@@ -9969,10 +10762,297 @@ begin
   c.TextOut(X, TextY, s);
 end;
 
+function TForm1.StatusBarDbType(out ADbType: TDbType): Boolean;
+var
+  Page: TTabSheet;
+begin
+  Result := True;
+  ADbType := dbList;
+  Page := pcMain.ActivePage;
+  if Page = tsList then ADbType := dbList
+  else if Page = tsShows then ADbType := dbShows
+  else if Page = tsEps then ADbType := dbEps
+  else if Page = tsLog then ADbType := dbLog
+  else if (Page = tsAbout) and (pcAbout.ActivePage = tsInfo) then
+    ADbType := dbAbout
+  else
+    Result := False;
+end;
+
 procedure TForm1.StatusBarMouseDown(Sender: TObject;
   Button: TMouseButton; Shift: TShiftState; X, Y: Integer);
 begin
   if Button = mbRight then actStatusBarFontExecute(Sender);
+end;
+
+// ---------------------------------------------------------------------------
+// MKV post-processing after a rename: subtitle flags, title, release group.
+//
+// RenameListItem used to do this for each MKV right after renaming it: an
+// mkvmerge run to list the subtitle tracks, then mkvpropedit to write the
+// flags, title and tags - processes started (through Wine, for the bundled
+// Windows builds on Linux) and waited for one file after another. Now a
+// rename run (RenameThisList, DealWithSpecialFiles) is wrapped in
+// BeginMKVBatch/EndMKVBatch: RenameListItem only queues each renamed MKV
+// (QueueMKVEdit), and EndMKVBatch processes them all at once
+// (FlushMKVEdits) - every mkvmerge side by side, then every mkvpropedit.
+// The renames themselves, and every DBF write, still happen one at a time
+// on the main thread, exactly as before.
+// ---------------------------------------------------------------------------
+
+procedure TForm1.BeginMKVBatch;
+begin
+  Inc(FMKVBatchDepth);
+end;
+
+procedure TForm1.EndMKVBatch;
+begin
+  if FMKVBatchDepth > 0 then Dec(FMKVBatchDepth);
+  if FMKVBatchDepth = 0 then FlushMKVEdits;
+end;
+
+// AFileName (its new name) in ADir has just been renamed from
+// AOriginalName. ASubTracks is its SubTracksFromProbe value, or '' if the
+// parse pass didn't probe it. Outside a batch it is processed straight
+// away.
+procedure TForm1.QueueMKVEdit(const ADir, AFileName, AOriginalName,
+  ASubTracks: String);
+begin
+  SetLength(FMKVJobSubTracks, Length(FMKVJobSubTracks) + 1);
+  FMKVJobSubTracks[High(FMKVJobSubTracks)] := ASubTracks;
+  SetLength(FMKVJobDirs, Length(FMKVJobDirs) + 1);
+  FMKVJobDirs[High(FMKVJobDirs)] := ADir;
+  SetLength(FMKVJobFiles, Length(FMKVJobFiles) + 1);
+  FMKVJobFiles[High(FMKVJobFiles)] := AFileName;
+  // Guessed here, on the main thread: GuessReleaseGroup keeps one shared
+  // guesser (uReleaseGroup).
+  SetLength(FMKVJobGroups, Length(FMKVJobGroups) + 1);
+  FMKVJobGroups[High(FMKVJobGroups)] := GuessReleaseGroup(AOriginalName);
+  DebugLog(sb(['QueueMKVEdit: release group for ', AOriginalName, ' = "',
+    FMKVJobGroups[High(FMKVJobGroups)], '"']));
+  if FMKVBatchDepth = 0 then FlushMKVEdits;
+end;
+
+procedure TForm1.MKVProgress(ADone, ATotal: Integer);
+begin
+  if FIsShuttingDown then Exit;
+  StatusBar.Panels[0].Text :=
+    sb([FMKVPhase, ': ', ADone, ' of ', ATotal, '...']);
+end;
+
+// mkvmerge's JSON listing of AFileName's tracks (relative to the folder the
+// command runs in), through Wine when mkvmerge is the bundled Windows
+// build on Linux (g.WineMKVMerge is then 'wine '), like every other tool.
+function TForm1.MKVMergeIdentifyCommandLine(const AFileName: String): String;
+begin
+  if Trim(g.WineMKVMerge) = '' then
+    Result := sb([g.FilePathMKVMerge.Value.Quote, ' -J ', AFileName.Quote])
+  else
+    Result := sb(['wine ', g.FilePathMKVMerge.Value.Quote, ' -J ',
+      AFileName.Quote]);
+end;
+
+function TForm1.TakeProbedSubTracks(const AFileName: String): String;
+var
+  i: Integer;
+begin
+  Result := '';
+  if not Assigned(FProbedSubTracks) then Exit;
+  if FProbedSubTracks.Find(SubTracksKey(AFileName), i) then
+  begin
+    Result := FProbedSubTracks.Data[i];
+    FProbedSubTracks.Delete(i);
+  end;
+end;
+
+// The mkvpropedit arguments, from mkvmerge's JSON track listing, that make
+// the file's first English subtitle track the default, forced one and
+// clear both flags on every other subtitle track - e.g. ' --edit track:@3
+// --set flag-default=1 --set flag-forced=1 --edit track:@4 --set
+// flag-default=0 --set flag-forced=0', with the leading space. '' when
+// there are no subtitle tracks, or AJSON isn't a listing (mkvmerge
+// missing, or it failed).
+function TForm1.SubtitleFlagArgsFromJSON(const AJSON: String): String;
+var
+  i, iEnglishID, iID: Integer;
+  IDs: array of Integer;
+  oJSON: TJSONData;
+  oProps, oRoot, oTrack: TJSONObject;
+  oTracks: TJSONArray;
+  sLang, sLangIETF: String;
+begin
+  Result := '';
+  // Don't go by mkvmerge's exit code: it can exit non-zero on warnings
+  // while still writing valid JSON, so the output itself is checked.
+  if Trim(AJSON) = '' then Exit;
+  iEnglishID := -1;
+  IDs := nil;
+  oJSON := nil;
+  try
+    try
+      oJSON := GetJSON(AJSON);
+      if not (oJSON is TJSONObject) then Exit;
+      oRoot := TJSONObject(oJSON);
+      oTracks := oRoot.Get('tracks', TJSONArray(nil));
+      if not Assigned(oTracks) then Exit;
+      for i := 0 to oTracks.Count - 1 do
+      begin
+        oTrack := oTracks.Objects[i];
+        if oTrack.Get('type', '') <> 'subtitles' then Continue;
+        iID := oTrack.Get('id', -1);
+        // A track listed without an id would come out as track:@0, which
+        // mkvpropedit rejects - and, sharing one command with the title
+        // and tags, that would cost the title and tags too.
+        if iID < 0 then Continue;
+        SetLength(IDs, Length(IDs) + 1);
+        IDs[High(IDs)] := iID;
+        // Only the first English track is kept.
+        if iEnglishID = -1 then
+        begin
+          oProps := oTrack.Get('properties', TJSONObject(nil));
+          if Assigned(oProps) then
+          begin
+            sLang := oProps.Get('language', '');
+            sLangIETF := oProps.Get('language_ietf', '');
+            if (sLang = 'eng') or sLangIETF.StartsWith('en') then
+              iEnglishID := iID;
+          end;
+        end;
+      end;
+    except
+      // Not JSON (an error message, say): leave the subtitle flags alone.
+      on E: Exception do
+      begin
+        DebugLog('SubtitleFlagArgsFromJSON: not a track listing - ' +
+          E.Message);
+        Exit('');
+      end;
+    end;
+  finally
+    FreeAndNil(oJSON);
+  end;
+  for iID in IDs do
+  begin
+    // mkvmerge's track IDs are 0-based, mkvpropedit's track numbers 1-based.
+    Result := sb([Result, ' --edit track:@', iID + 1]);
+    // The English track is turned on; every other subtitle track, off.
+    if (iEnglishID <> -1) and (iID = iEnglishID) then
+      Result := Result + ' --set flag-default=1 --set flag-forced=1'
+    else
+      Result := Result + ' --set flag-default=0 --set flag-forced=0';
+  end;
+end;
+
+// Gives every queued MKV its subtitle flags, title and release-group tags,
+// then runs all the mkvpropedit commands at once (one each, writing
+// everything). A file's subtitle tracks come from the ffprobe output the
+// parse pass already had (FMKVJobSubTracks); only files without that -
+// not probed, or renamed back by Undo - get an mkvmerge listing, all of
+// those side by side first. Each command runs in the file's own folder,
+// using its bare name, as RenameListItem's SetCurrentDir used to arrange
+// - but per process, since the process-wide current directory can't serve
+// several commands at a time. Pumps messages while it waits; its callers
+// hold their own re-entrancy gates (FIsRenaming, FIsScanning).
+procedure TForm1.FlushMKVEdits;
+var
+  bFinished: Boolean;
+  Dirs, Edits, Files, Groups, Identify, IdentifyDirs, Outputs, SubArgs,
+    SubTracks, TagFiles: TStringArray;
+  ExitCodes, IdentifyIdx: TIntegerArray;
+  i, j, n: Integer;
+  sCommandLine, sTagFile: String;
+begin
+  n := Length(FMKVJobFiles);
+  if n = 0 then Exit;
+  // Taken off the queue first: anything queued while this waits belongs
+  // to the next flush.
+  Dirs := FMKVJobDirs;
+  Files := FMKVJobFiles;
+  Groups := FMKVJobGroups;
+  SubTracks := FMKVJobSubTracks;
+  FMKVJobDirs := nil;
+  FMKVJobFiles := nil;
+  FMKVJobGroups := nil;
+  FMKVJobSubTracks := nil;
+  // Every queue entry gets one; guards against a short array all the same.
+  SetLength(SubTracks, n);
+  if not EnsureMKVToolsAvailable(False, True) then Exit;
+  // 1. Every file's subtitle flags: from its probed tracks where there are
+  // some, otherwise from mkvmerge's listing.
+  SubArgs := nil;
+  SetLength(SubArgs, n);
+  IdentifyIdx := nil;
+  for i := 0 to n - 1 do
+    if not TrySubtitleFlagArgsFromSubTracks(SubTracks[i], SubArgs[i]) then
+    begin
+      SetLength(IdentifyIdx, Length(IdentifyIdx) + 1);
+      IdentifyIdx[High(IdentifyIdx)] := i;
+    end;
+  // Only now, and only if some file needs it: when every file was probed,
+  // mkvmerge isn't looked for (or re-discovered) at all.
+  if (Length(IdentifyIdx) > 0) and EnsureMKVToolsAvailable(True, False) then
+  begin
+    Identify := nil;
+    IdentifyDirs := nil;
+    SetLength(Identify, Length(IdentifyIdx));
+    SetLength(IdentifyDirs, Length(IdentifyIdx));
+    for j := 0 to High(IdentifyIdx) do
+    begin
+      Identify[j] := MKVMergeIdentifyCommandLine(Files[IdentifyIdx[j]]);
+      IdentifyDirs[j] := Dirs[IdentifyIdx[j]];
+    end;
+    FMKVPhase := 'Reading MKV subtitle tracks';
+    Outputs := nil;
+    RunExBatchAndWait(Identify, IdentifyDirs, Outputs, ExitCodes,
+      ParallelThreadCount(4), False, @MKVProgress);
+    for j := 0 to High(IdentifyIdx) do
+      if j <= High(Outputs) then
+        SubArgs[IdentifyIdx[j]] := SubtitleFlagArgsFromJSON(Outputs[j]);
+  end;
+  // 2. One mkvpropedit command per file: subtitle flags, title, and the
+  // release group (each file its own tags file - they run at once).
+  Edits := nil;
+  TagFiles := nil;
+  SetLength(Edits, n);
+  SetLength(TagFiles, n);
+  for i := 0 to n - 1 do
+  begin
+    sCommandLine := sb([g.WineMKVPropEdit, g.FilePathMKVPropEdit.Value.Quote,
+      Space, Files[i].Quote, SubArgs[i],
+      ' -e info -s ', ('title=' + Files[i]).Quote]);
+    if Groups[i].IsNotEmpty then
+    begin
+      sTagFile := CombinePath(g.OpPath.Value,
+        sb(['release_group_tags_', i, '.xml']));
+      if WriteReleaseGroupTagsFile(Groups[i], sTagFile) then
+      begin
+        sCommandLine := sb([sCommandLine, ' --tags ',
+          ('global:' + sTagFile).Quote]);
+        TagFiles[i] := sTagFile;
+      end;
+    end;
+    Edits[i] := sCommandLine;
+  end;
+  FMKVPhase := 'Updating MKV titles and subtitles';
+  bFinished := RunExBatchAndWait(Edits, Dirs, Outputs, ExitCodes,
+    ParallelThreadCount(4), True, @MKVProgress);
+  // A tags file is only removed once its mkvpropedit has finished with it;
+  // if the wait was given up (a hung mkvpropedit), the rest stay behind
+  // and are simply overwritten next time.
+  for i := 0 to n - 1 do
+    if TagFiles[i].IsNotEmpty and (bFinished or (ExitCodes[i] <> -1)) then
+      DeleteIfExists(TagFiles[i]);
+end;
+
+// The command uUtils.ToolRunsOK runs, as one command line, for
+// RunExBatchAndWait (ValidateAndDiscoverTools checks every tool at once).
+function TForm1.ToolCheckCommandLine(const AWinePrefix, AExePath,
+  AVersionArg: String): String;
+begin
+  if AWinePrefix <> EmptyStr then
+    Result := sb(['wine ', AExePath.Quote, Space, AVersionArg])
+  else
+    Result := sb([AExePath.Quote, Space, AVersionArg]);
 end;
 
 procedure TForm1.SwapFromTo(var Op: TRenameOperationState);
@@ -10486,12 +11566,16 @@ end;
 procedure TForm1.UpdateStatusBar;
 var
   CurrentPage: TTabSheet;
+  DbType: TDbType;
   HasStatus: Boolean;
 begin
   if Self.IsResizing or pcMain.IsResizing or not pcMain.Showing then Exit;
 
   CurrentPage := pcMain.ActivePage;
-  if (CurrentPage = nil) or (not CurrentPage.Showing) then Exit;
+  // Not CurrentPage.Showing as well: inside pcMainChange the new page's
+  // Showing may not have caught up yet, which left the previous page's
+  // status (e.g. the Source Code tab's READ-ONLY) on the bar.
+  if CurrentPage = nil then Exit;
 
   DisableAlign;
   try
@@ -10499,18 +11583,14 @@ begin
 
     HasStatus := True;
 
-    // Pure pointer comparisons: lightning fast and no magic numbers!
-    if CurrentPage = tsList then ShowStatusDBF(dbList)
-    else if CurrentPage = tsShows then ShowStatusDBF(dbShows)
-    else if CurrentPage = tsEps then ShowStatusDBF(dbEps)
-    else if CurrentPage = tsLog then ShowStatusDBF(dbLog)
+    // A table's page (including About > Info) first, then the others.
+    if StatusBarDbType(DbType) then ShowStatusDBF(DbType)
     else if CurrentPage = tsBrowser then ShowStatusBrowser
     else if CurrentPage = tsProgress then
       HasStatus := False // Explicitly handle the progress tab
     else if CurrentPage = tsAbout then
     begin
-      if pcAbout.ActivePage = tsInfo then ShowStatusDBF(dbAbout)
-      else if pcAbout.ActivePage = tsSourceCode then ShowStatusSourceCode
+      if pcAbout.ActivePage = tsSourceCode then ShowStatusSourceCode
       else
       begin
         // License/Readme/Privacy: documents nobody expects to edit, so no
@@ -10554,7 +11634,7 @@ const
   // Retired by IniVersion 3: the colon-only setting, which became
   // ReservedCharacters (same values) when every character Windows forbids
   // got a look-alike.
-  RETIRED_IN_3: array[0..0] of String = ('ColonReplacement');
+  RETIRED_IN_3: array[0..0] of String = (INI_KEY_COLON_REPLACEMENT);
 var
   iFound, iRemoved: Integer;
   ini: TIniFile;
@@ -10563,21 +11643,21 @@ begin
   // being there - so nothing is written here; SaveConfiguration gives the
   // new file INI_VERSION when filey closes.
   if not AppIni.Exists then Exit;
-  iFound := AppIni.Value.ReadInteger('Main', 'IniVersion', 1);
+  iFound := AppIni.Value.ReadInteger(INI_MAIN, INI_KEY_INI_VERSION, 1);
   if iFound >= INI_VERSION then Exit;
   iRemoved := 0;
   try
-    if iFound < 2 then Inc(iRemoved, AppIni.DeleteKeys('Main', RETIRED_IN_2));
+    if iFound < 2 then Inc(iRemoved, AppIni.DeleteKeys(INI_MAIN, RETIRED_IN_2));
     if iFound < 3 then
     begin
       ini := AppIni.Value;
-      if ini.ValueExists('Main', 'ColonReplacement') and not
-        ini.ValueExists('Main', 'ReservedCharacters') then
-        ini.WriteString('Main', 'ReservedCharacters',
-          ini.ReadString('Main', 'ColonReplacement', 'lookalike'));
-      Inc(iRemoved, AppIni.DeleteKeys('Main', RETIRED_IN_3));
+      if ini.ValueExists(INI_MAIN, INI_KEY_COLON_REPLACEMENT) and not
+        ini.ValueExists(INI_MAIN, INI_KEY_RESERVED_CHARACTERS) then
+        ini.WriteString(INI_MAIN, INI_KEY_RESERVED_CHARACTERS,
+          ini.ReadString(INI_MAIN, INI_KEY_COLON_REPLACEMENT, 'lookalike'));
+      Inc(iRemoved, AppIni.DeleteKeys(INI_MAIN, RETIRED_IN_3));
     end;
-    AppIni.Value.WriteInteger('Main', 'IniVersion', INI_VERSION);
+    AppIni.Value.WriteInteger(INI_MAIN, INI_KEY_INI_VERSION, INI_VERSION);
     DebugLog(sb(['UpgradeIniFile: ', g.IniFileName, ' from IniVersion ',
       iFound, ' to ', INI_VERSION, ', ', iRemoved, ' old key(s) removed']));
   except
@@ -10588,18 +11668,35 @@ begin
 end;
 
 procedure TForm1.ValidateAndDiscoverTools;
-var
-  sDetectedDir, sMKVMergeExeName, sWinePrefix, sFileName: String;
 begin
-  // Each tool is discovered the same, precise way: prefer a native Linux
-  // build on PATH, otherwise fall back to the bundled Windows build run
-  // through Wine - and the result is only trusted once verified to both
-  // exist AND actually run (see DiscoverExternalTool).
-  g.FilePathFFProbe := DiscoverExternalTool('ffprobe',
-    'ffprobe.exe', '-version', sWinePrefix, sFileName);
-  g.WineFFProbe := sWinePrefix;
-  g.FileNameFFProbe := sFileName;
+  if FIsValidatingTools then Exit;
+  FIsValidatingTools := True;
+  try
+    ValidateAndDiscoverToolsNow;
+  finally
+    FIsValidatingTools := False;
+  end;
+end;
 
+procedure TForm1.ValidateAndDiscoverToolsNow;
+const
+  // The three tools, in this order everywhere below.
+  TOOL_FFPROBE = 0;
+  TOOL_MKVPROPEDIT = 1;
+  TOOL_MKVMERGE = 2;
+  LINUX_NAMES: array[0..2] of String = ('ffprobe', 'mkvpropedit', 'mkvmerge');
+  WINDOWS_NAMES: array[0..2] of String =
+    ('ffprobe.exe', 'mkvpropedit.exe', 'mkvmerge.exe');
+  // See uUtils.ToolRunsOK: ffprobe only exits cleanly for "-version".
+  VERSION_ARGS: array[0..2] of String = ('-version', '--version', '--version');
+var
+  Bundled: TStringArray;
+  BundledTool, CheckedTool, ExitCodes: TIntegerArray;
+  Commands, Outputs: TStringArray;
+  FileNames, Paths, Wines: array[0..2] of String;
+  i: Integer;
+  sDetectedDir, sFound, sMKVMergeExeName: String;
+begin
   // mkvpropedit.exe / mkvmerge.exe (Windows builds) are PINNED to v64.0.0
   // "Willows" (2021-12-27), 32-bit - deliberately, not by neglect. This is
   // the last official mkvtoolnix release built against Qt5. Every build
@@ -10615,15 +11712,106 @@ begin
   // 7/8.1 compatibility first (i.e. confirming any replacement is still a
   // Qt5-era build), since a newer official release will silently break
   // launching on those two OSes even though it works fine on Windows 10/11.
-  g.FilePathMKVPropEdit := DiscoverExternalTool('mkvpropedit',
-    'mkvpropedit.exe', '--version', sWinePrefix, sFileName);
-  g.WineMKVPropEdit := sWinePrefix;
-  g.FileNameMKVPropEdit := sFileName;
 
-  g.FilePathMKVMerge := DiscoverExternalTool('mkvmerge',
-    'mkvmerge.exe', '--version', sWinePrefix, sFileName);
-  g.WineMKVMerge := sWinePrefix;
-  g.FileNameMKVMerge := sFileName;
+  // Each tool is discovered the same, precise way as DiscoverExternalTool
+  // (which EnsureToolAvailable still uses for one tool at a time): prefer
+  // a native Linux build on PATH, otherwise fall back to the bundled
+  // Windows build run through Wine - and the result is only trusted once
+  // verified to both exist AND actually run. Here, though, the three
+  // tools go through each step together: the bundled ones that are needed
+  // are extracted side by side, and all three version checks - each of
+  // which can take seconds through Wine - run at the same time, so the
+  // whole check takes about as long as the slowest tool rather than the
+  // three added up. This runs on every launch.
+
+  // 1. Native builds on PATH (Linux only).
+  for i := TOOL_FFPROBE to TOOL_MKVMERGE do
+  begin
+    Paths[i] := EmptyStr;
+    Wines[i] := EmptyStr;
+    FileNames[i] := EmptyStr;
+    if g.IsLinux then
+    begin
+      sFound := FindPathTo(LINUX_NAMES[i]);
+      if sFound <> EmptyStr then
+      begin
+        FileNames[i] := LINUX_NAMES[i];
+        Paths[i] := SafeExpandFileName(sFound);
+      end;
+    end;
+  end;
+
+  // 2. The bundled Windows build for every tool not found natively,
+  // extracted from filey-src.zip together. As in DiscoverExternalTool, the
+  // Wine prefix and file name are set even if the .exe can't be found.
+  Bundled := nil;
+  BundledTool := nil;
+  for i := TOOL_FFPROBE to TOOL_MKVMERGE do
+    if Paths[i] = EmptyStr then
+    begin
+      SetLength(Bundled, Length(Bundled) + 1);
+      Bundled[High(Bundled)] := WINDOWS_NAMES[i];
+      SetLength(BundledTool, Length(BundledTool) + 1);
+      BundledTool[High(BundledTool)] := i;
+    end;
+  if Length(Bundled) > 0 then
+  begin
+    ExtractFromSourceZipParallel(Bundled, []);
+    for i in BundledTool do
+    begin
+      if g.IsLinux then Wines[i] := 'wine ';
+      FileNames[i] := WINDOWS_NAMES[i];
+      sFound := FindPathTo(WINDOWS_NAMES[i]);
+      if sFound <> EmptyStr then Paths[i] := SafeExpandFileName(sFound);
+    end;
+  end;
+
+  // 3. Every tool found is run once, all at the same time, to prove it
+  // starts (ToolRunsOK's test: exit code 0). A file that has gone missing
+  // since is discarded without running anything.
+  Commands := nil;
+  CheckedTool := nil;
+  for i := TOOL_FFPROBE to TOOL_MKVMERGE do
+  begin
+    if (Paths[i] = EmptyStr) or not FileExists(Paths[i]) then Continue;
+    SetLength(Commands, Length(Commands) + 1);
+    Commands[High(Commands)] :=
+      ToolCheckCommandLine(Wines[i], Paths[i], VERSION_ARGS[i]);
+    SetLength(CheckedTool, Length(CheckedTool) + 1);
+    CheckedTool[High(CheckedTool)] := i;
+  end;
+  RunExBatchAndWait(Commands, [], Outputs, ExitCodes, Length(Commands));
+  for i := TOOL_FFPROBE to TOOL_MKVMERGE do
+    if (Paths[i] <> EmptyStr) and not FileExists(Paths[i]) then
+    begin
+      DebugLog(sb(['ValidateAndDiscoverTools: "', FileNames[i],
+        '" resolved to "', Paths[i], '" but the file is missing - ',
+        'discarding.']));
+      Paths[i] := EmptyStr;
+      Wines[i] := EmptyStr;
+      FileNames[i] := EmptyStr;
+    end;
+  for i := 0 to High(CheckedTool) do
+    if ExitCodes[i] <> 0 then
+    begin
+      DebugLog(sb(['ValidateAndDiscoverTools: "', FileNames[CheckedTool[i]],
+        '" resolved to "', Paths[CheckedTool[i]],
+        '" but would not run (exit code ', ExitCodes[i], ') - discarding.']));
+      Paths[CheckedTool[i]] := EmptyStr;
+      Wines[CheckedTool[i]] := EmptyStr;
+      FileNames[CheckedTool[i]] := EmptyStr;
+    end;
+
+  // 4. Publish what was found.
+  g.FilePathFFProbe := Paths[TOOL_FFPROBE];
+  g.WineFFProbe := Wines[TOOL_FFPROBE];
+  g.FileNameFFProbe := FileNames[TOOL_FFPROBE];
+  g.FilePathMKVPropEdit := Paths[TOOL_MKVPROPEDIT];
+  g.WineMKVPropEdit := Wines[TOOL_MKVPROPEDIT];
+  g.FileNameMKVPropEdit := FileNames[TOOL_MKVPROPEDIT];
+  g.FilePathMKVMerge := Paths[TOOL_MKVMERGE];
+  g.WineMKVMerge := Wines[TOOL_MKVMERGE];
+  g.FileNameMKVMerge := FileNames[TOOL_MKVMERGE];
 
   // Fallback: MKVToolNix always ships mkvmerge and mkvpropedit side by side.
   // If independent discovery above found mkvpropedit but somehow missed
@@ -10669,8 +11857,8 @@ procedure TForm1.WriteSourceCodeFont(ini: TIniFile; APage: TTabSheet;
   AEdit: TSynEdit);
 begin
   if not (Assigned(ini) and Assigned(APage) and Assigned(AEdit)) then Exit;
-  ini.WriteString('Main', APage.Name + '.Font.Name', AEdit.Font.Name);
-  ini.WriteInteger('Main', APage.Name + '.Font.Size', AEdit.Font.Size);
+  ini.WriteString(INI_MAIN, APage.Name + '.Font.Name', AEdit.Font.Name);
+  ini.WriteInteger(INI_MAIN, APage.Name + '.Font.Size', AEdit.Font.Size);
 end;
 
 // Empties SHOWS.DBF and EPS.DBF and rebuilds SHOWS.DBF from allshows.txt -

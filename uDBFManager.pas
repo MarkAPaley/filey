@@ -78,7 +78,7 @@ type
 // Creates a TDataSource for aDB if one doesn't already exist, and (re)binds
 // its AutoEdit/DataSet/Name/Enabled properties. AOwner is the component that
 // will own a newly-created TDataSource.
-procedure AssignDBFDataSource(var aDB: TDbf; var ADataSource: TDataSource;
+procedure AssignDBFDataSource(const aDB: TDbf; var ADataSource: TDataSource;
   AOwner: TComponent);
 
 // Creates and opens every not-yet-assigned entry in ADbfArray: builds the
@@ -119,7 +119,7 @@ procedure CreateAndOpenDBFs(var ADbfArray: TDBFArray;
 // next thing that runs anyway, so there's nothing meaningful lost by not
 // reporting it here. Raises uDBF.EDbfReadOnly on a physically read-only
 // table.
-procedure PackThisTable(var aDB: TDbf);
+procedure PackThisTable(const aDB: TDbf);
 
 // Adds an index to an already-open aDB. Index creation/rebuild requires
 // exclusive access (TDbf raises EDbfError from deep inside AddIndex if it
@@ -131,8 +131,8 @@ procedure PackThisTable(var aDB: TDbf);
 // already be open. Raises uDBF.EDbfReadOnly on a physically read-only
 // table - check uDBF.IsPhysicallyReadOnly first where an index is merely
 // nice to have.
-procedure AddIndexExclusive(var aDB: TDbf; const AIndexName, AFields: String;
-  AOptions: TIndexOptions);
+procedure AddIndexExclusive(const aDB: TDbf;
+  const AIndexName, AFields: String; AOptions: TIndexOptions);
 
 // Drops an index from an already-open aDB, if it exists. A no-op if
 // AIndexName isn't currently defined - so callers can call this
@@ -146,7 +146,7 @@ procedure AddIndexExclusive(var aDB: TDbf; const AIndexName, AFields: String;
 // exclusive access). Raises uDBF.EDbfReadOnly on a physically read-only
 // table, even if the index doesn't exist (the caller is about to write
 // to the table anyway).
-procedure DeleteIndexIfPresentExclusive(var aDB: TDbf;
+procedure DeleteIndexIfPresentExclusive(const aDB: TDbf;
   const AIndexName: String);
 
 // Deletes every record in aDB (irreversible) and packs the file. Unlike
@@ -154,7 +154,7 @@ procedure DeleteIndexIfPresentExclusive(var aDB: TDbf;
 // destructive, so "it happened and it finished" is worth keeping somewhere,
 // even if it's no longer the status bar. Pass @DebugLog, for example.
 // Raises uDBF.EDbfReadOnly on a physically read-only table.
-procedure ZapPackTable(var aDB: TDbf; AOnStatus: TDBFStatusEvent = nil);
+procedure ZapPackTable(const aDB: TDbf; AOnStatus: TDBFStatusEvent = nil);
 
 implementation
 
@@ -175,7 +175,7 @@ uses
 // pfReadOnly"), which silently discarded a POLICY read-only setting
 // (TForm1.actReadOnlyExecute) every time a table was packed, zapped or
 // re-indexed.
-function AcquireExclusive(var aDB: TDbf; const AOperation: String): Boolean;
+function AcquireExclusive(const aDB: TDbf; const AOperation: String): Boolean;
 begin
   // Refuse before touching the lock at all: a physically read-only table
   // can never be escalated, and the reason is more useful than
@@ -193,7 +193,7 @@ begin
   end;
 end;
 
-procedure AssignDBFDataSource(var aDB: TDbf; var ADataSource: TDataSource;
+procedure AssignDBFDataSource(const aDB: TDbf; var ADataSource: TDataSource;
   AOwner: TComponent);
 begin
   if (not Assigned(ADataSource)) then
@@ -577,14 +577,14 @@ end;
 
 // Counterpart to AcquireExclusive: drops back to shared access and
 // restores the policy ReadOnly flag AcquireExclusive saved.
-procedure ReleaseExclusive(var aDB: TDbf; AWasReadOnly: Boolean);
+procedure ReleaseExclusive(const aDB: TDbf; AWasReadOnly: Boolean);
 begin
   aDB.EndExclusive;
   aDB.ReadOnly := AWasReadOnly;
 end;
 
-procedure AddIndexExclusive(var aDB: TDbf; const AIndexName, AFields: String;
-  AOptions: TIndexOptions);
+procedure AddIndexExclusive(const aDB: TDbf;
+  const AIndexName, AFields: String; AOptions: TIndexOptions);
 var
   WasReadOnly: Boolean;
 begin
@@ -596,7 +596,7 @@ begin
   end;
 end;
 
-procedure DeleteIndexIfPresentExclusive(var aDB: TDbf;
+procedure DeleteIndexIfPresentExclusive(const aDB: TDbf;
   const AIndexName: String);
 var
   WasReadOnly: Boolean;
@@ -617,7 +617,7 @@ begin
   end;
 end;
 
-procedure PackThisTable(var aDB: TDbf);
+procedure PackThisTable(const aDB: TDbf);
 var
   WasReadOnly: Boolean;
 begin
@@ -639,7 +639,7 @@ begin
   end;
 end;
 
-procedure ZapPackTable(var aDB: TDbf; AOnStatus: TDBFStatusEvent);
+procedure ZapPackTable(const aDB: TDbf; AOnStatus: TDBFStatusEvent);
 var
   WasReadOnly: Boolean;
 begin

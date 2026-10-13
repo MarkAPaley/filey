@@ -29,6 +29,9 @@ unit uUtils;
      RunEx(exe,params,exitcode)        -> RunExDrain directly (no parsing needed)
      RunExAsync                        -> TRunExThread -> RunExCore -> RunExDrain
      RunExBatch                        -> TRunExBatchCoordinator -> N x TRunExThread -> RunExCore -> RunExDrain
+   On a TRunExThread nothing is logged: DebugLog (LazLogger) and LogError
+   aren't thread-safe. The command line is logged on the main thread before
+   the thread starts, and a failure to start it once the thread is done.
 ============================================================================== }
 
 {$mode objfpc}{$H+}
@@ -72,6 +75,22 @@ type
   // Always invoked on the main thread.
   TRunExBatchCompleteCallback =
     procedure(ASucceededCount, AFailedCount: Integer) of object;
+
+  // =============================================================================
+  //  RunParallel() / RunExBatchAndWait() TYPES
+  // =============================================================================
+  // One job of a RunParallel call, run on a worker thread. It must not touch
+  // the LCL, any TDbf, or anything else the main thread may be using; it
+  // works only on data prepared for it beforehand, at its own AIndex.
+  // DebugLog and LogError are safe to call from it.
+  TParallelJob = procedure(AIndex: Integer) of object;
+  TBooleanArray = array of Boolean;
+  TIntegerArray = array of Integer;
+  // How many jobs (or commands) have finished, of how many. Main thread.
+  TParallelProgress = procedure(ADone, ATotal: Integer) of object;
+  // Asked now and then on the main thread; True stops RunParallel handing
+  // out jobs that haven't started yet.
+  TParallelCancelCheck = function: Boolean of object;
 
   // =============================================================================
   //  ExtractFileFromZip() CALLBACK TYPE
@@ -241,8 +260,8 @@ function EnsureOpenSSLDllsPresent: Boolean;
 function FastRemovePunctuation(const s: String): String;
 function FileExists(const Path: String): Boolean;
 function FileExistsStr(const aCaseSensitiveFileName: String): Boolean;
-function FindAllFilesThrottled(const APath: String; AMask: String = '';
-  ASearchSubDirs: Boolean = True): TStringList;
+function FindAllFilesThrottled(const APath: String;
+  const AMask: String = ''; ASearchSubDirs: Boolean = True): TStringList;
 function FindBestFont(const PriorityList: array of String): String;
 procedure FindFilesWithMaskList(AList: TStrings; const APath: String;
   AMaskList: TMaskList);
@@ -314,7 +333,7 @@ function PosInsensitiveASCII(const SubStr, s: String): Integer;
 // is what epguides.com's allshows.txt is actually encoded in.
 function ProcessCP1252CSV(CSVLines: TStrings;
   const AFileName: String): TStrings;
-function RemoveAllSpacesAndDots(s: String): String;
+function RemoveAllSpacesAndDots(const s: String): String;
 function RemoveDiacritics(const s: String): String;
 
 // Extracts AArchiveFileName from AZipFileName to ADiskFileName, replacing
@@ -350,7 +369,41 @@ procedure RunExAsync(const sCommandLine: String; ACallback: TRunExCallback;
 procedure RunExBatch(const ACommandLines: array of String;
   AItemCallback: TRunExBatchItemCallback;
   ACompleteCallback: TRunExBatchCompleteCallback = nil;
-  AMaxConcurrency: Integer = 4; bRedirectErr: Boolean = False);
+  AMaxConcurrency: Integer = 4; bRedirectErr: Boolean = False); overload;
+// The same, with each command run in its own working directory:
+// ACurrentDirs[i] for ACommandLines[i] ('' or a missing entry: the
+// program's own). Unlike SetCurrentDir, that is per process, so it is safe
+// with several commands running at once.
+procedure RunExBatch(const ACommandLines, ACurrentDirs: array of String;
+  AItemCallback: TRunExBatchItemCallback;
+  ACompleteCallback: TRunExBatchCompleteCallback = nil;
+  AMaxConcurrency: Integer = 4; bRedirectErr: Boolean = False); overload;
+// Runs ACommandLines through RunExBatch (in ACurrentDirs, as above) and
+// waits for them, keeping the window responsive (Application.
+// ProcessMessages), then returns each command's output and exit code at
+// the same index. AOnProgress, if given, is told as commands finish.
+// Returns False only if it stopped waiting: no command finished for
+// AStallMs (0: never stop). The commands still running then finish on
+// their own, and their results are dropped; AOutputs holds '' and
+// AExitCodes -1 for them.
+function RunExBatchAndWait(const ACommandLines, ACurrentDirs: array of String;
+  out AOutputs: TStringArray; out AExitCodes: TIntegerArray;
+  AMaxConcurrency: Integer = 4; bRedirectErr: Boolean = False;
+  AOnProgress: TParallelProgress = nil; AStallMs: QWord = 120000): Boolean;
+// Runs AJob(0) .. AJob(ACount - 1) on up to AMaxThreads worker threads
+// and waits for all of them, keeping the window responsive (Application.
+// ProcessMessages). AOnProgress, if given, is told as jobs finish;
+// ACancelCheck, if given, can stop jobs that haven't started yet. An
+// exception in a job is caught, logged and counted as that job failing;
+// the other jobs carry on. Returns the number of jobs that ran to the end
+// without one. With one job, one thread or no thread support, the jobs
+// simply run here, on the main thread.
+function RunParallel(ACount: Integer; AJob: TParallelJob;
+  AMaxThreads: Integer; AOnProgress: TParallelProgress = nil;
+  ACancelCheck: TParallelCancelCheck = nil): Integer;
+// Worker threads worth starting for disk- or process-bound jobs: the
+// processor count, but never fewer than 2 nor more than AMax.
+function ParallelThreadCount(AMax: Integer = 8): Integer;
 procedure SafeClearGridColumns(Grid: TDBGrid);
 function SafeCopy(const Source: String; StartPos, Length: Integer): String;
 function SafeExpandFilename(const FileName: String): String;
@@ -417,6 +470,23 @@ uses
   Character, crc, db, FileUtil, Graphics, LazFileUtils, LazUTF8,
   LConvEncoding, Math, Process, StrUtils, SynEdit, TypInfo,
   Variants, uManagedUtils, URIParser; //, ZStream {for clmax};
+
+var
+  // Serializes DebugLog and LogError (see DebugLog), so worker threads can
+  // log. Set up first thing in this unit's initialization.
+  //
+  // System.TRTLCriticalSection, and System.EnterCriticalSection/
+  // LeaveCriticalSection below, are qualified on purpose: on Windows the
+  // Windows and JwaWindows units (interface uses) declare their own
+  // TRTLCriticalSection (= _RTL_CRITICAL_SECTION) and Enter/Leave
+  // functions, which would otherwise win, while InitCriticalSection and
+  // DoneCriticalSection exist only in System and insist on its type.
+  LogLock: System.TRTLCriticalSection;
+  // Serializes ReadManifestEntry and WriteManifestEntry: each reads
+  // extracted-files.txt and WriteManifestEntry writes it back whole, so two
+  // extractions running at once (RunParallel) would otherwise lose one
+  // another's entries.
+  ManifestLock: System.TRTLCriticalSection;
 
 const
   // Compile-time constant table: built once by the compiler into the data
@@ -615,17 +685,23 @@ begin
   AStamp := -1;
   sManifest := ExtractManifestFileName;
   // An '=' would split the key, so such a path is simply never cached.
-  if (sManifest = '') or (Pos('=', ADiskFileName) > 0) or not
-    FileExists(sManifest) then Exit;
+  if (sManifest = '') or (Pos('=', ADiskFileName) > 0) then Exit;
+  System.EnterCriticalSection(ManifestLock);
   try
-    SL.Value.CaseSensitive := True; // Linux paths are
-    SL.Value.LoadFromFile(sManifest);
-    Parts := SL.Value.Values[ADiskFileName].Split([',']);
-    Result := (Length(Parts) = 3) and TryStrToDWord('$' + Parts[0], ACRC) and
-      TryStrToInt64(Parts[1], ASize) and TryStrToInt64(Parts[2], AStamp);
-  except
-    on E: Exception do DebugLog('ReadManifestEntry: could not read ' +
-        sManifest + ': ' + E.Message);
+    if not FileExists(sManifest) then Exit;
+    try
+      SL.Value.CaseSensitive := True; // Linux paths are
+      SL.Value.LoadFromFile(sManifest);
+      Parts := SL.Value.Values[ADiskFileName].Split([',']);
+      Result := (Length(Parts) = 3) and
+        TryStrToDWord('$' + Parts[0], ACRC) and
+        TryStrToInt64(Parts[1], ASize) and TryStrToInt64(Parts[2], AStamp);
+    except
+      on E: Exception do DebugLog('ReadManifestEntry: could not read ' +
+          sManifest + ': ' + E.Message);
+    end;
+  finally
+    System.LeaveCriticalSection(ManifestLock);
   end;
 end;
 
@@ -643,17 +719,22 @@ begin
   sManifest := ExtractManifestFileName;
   if sManifest = '' then Exit;
   if not FileSizeAndStamp(ADiskFileName, DiskSize, DiskStamp) then Exit;
+  System.EnterCriticalSection(ManifestLock);
   try
-    SL.Value.CaseSensitive := True;
-    if FileExists(sManifest) then SL.Value.LoadFromFile(sManifest);
-    SL.Value.Values[ADiskFileName] :=
-      sb([IntToHex(ACRC, 8), ',', DiskSize, ',', DiskStamp]);
-    SL.Value.SaveToFile(sManifest);
-  except
-    // Only a cache, so no error.log entry: the cost of failing is one
-    // extra CRC-32 check next time.
-    on E: Exception do DebugLog('WriteManifestEntry: could not update ' +
-        sManifest + ': ' + E.Message);
+    try
+      SL.Value.CaseSensitive := True;
+      if FileExists(sManifest) then SL.Value.LoadFromFile(sManifest);
+      SL.Value.Values[ADiskFileName] :=
+        sb([IntToHex(ACRC, 8), ',', DiskSize, ',', DiskStamp]);
+      SL.Value.SaveToFile(sManifest);
+    except
+      // Only a cache, so no error.log entry: the cost of failing is one
+      // extra CRC-32 check next time.
+      on E: Exception do DebugLog('WriteManifestEntry: could not update ' +
+          sManifest + ': ' + E.Message);
+    end;
+  finally
+    System.LeaveCriticalSection(ManifestLock);
   end;
 end;
 
@@ -1222,12 +1303,12 @@ begin
 end;
 
 // Thin wrapper around LazLogger's DebugLn: adds a timestamp prefix (DebugLn
-// doesn't supply one on its own) and otherwise defers entirely to
-// LazLogger's own file handling, buffering, and locking rather than
-// re-implementing them. DebugLn has been thread-safe since Lazarus 2.0, and
-// the underlying TLazLoggerFile (see DebugLogger/InitializeDebugLog below)
-// already owns and serializes access to its log file, so no locking or
-// manual AssignFile/Append/CloseFile cycle is needed here.
+// doesn't supply one on its own) and otherwise defers to LazLogger's own
+// file handling and buffering. LogLock makes it safe to call from worker
+// threads (RunParallel jobs, RunEx threads): it keeps two threads from
+// writing at once, and keeps each line in one piece on the console and in
+// debug.log alike, without relying on how thread-safe a given LazLogger
+// version happens to be.
 procedure DebugLog(const Msg: String);
 {$IFDEF DEBUG}
 var
@@ -1235,8 +1316,16 @@ var
 begin
   FormattedMsg := Format('[%s] %s',
     [FormatDateTime('YYYY-MM-DD hh:nn:ss', Now), Msg]);
-  WriteLn(StdErr, FormattedMsg); // console echo, same as before
-  DebugLn(FormattedMsg);        // file logging, now owned by LazLogger
+  System.EnterCriticalSection(LogLock);
+  try
+    WriteLn(StdErr, FormattedMsg); // console echo, same as before
+    // StdErr is per thread in FPC, each with its own buffer: flushed here,
+    // inside the lock, so lines from different threads can't splice.
+    Flush(StdErr);
+    DebugLn(FormattedMsg);        // file logging, now owned by LazLogger
+  finally
+    System.LeaveCriticalSection(LogLock);
+  end;
 end;
 {$ELSE}
 begin
@@ -1691,7 +1780,7 @@ begin
   end;
 end;
 
-function FindAllFilesThrottled(const APath: String; AMask: String;
+function FindAllFilesThrottled(const APath: String; const AMask: String;
   ASearchSubDirs: Boolean): TStringList;
 var
   Searcher: TSmartFileSearcher;
@@ -1986,10 +2075,23 @@ begin
   Result := (AGrid = nil) or (AGrid.Columns.Count = 0);
 end;
 
+type
+  // TLazLoggerFile.FileHandle is protected; a descendant declared here may
+  // set it.
+  TLazLoggerFileAccess = class(TLazLoggerFile);
+
 procedure InitializeDebugLog(const FileName: String = 'debug.log');
 begin
   {$IFDEF DEBUG}
     DeleteIfExists(CombinePath(OpPath, FileName));
+    // First, since CloseLogFileBetweenWrites below is a setting of the
+    // file handle: one that writes straight to the file from any thread,
+    // under its own lock. LazLogger's default handle instead queues a
+    // worker thread's lines for the main thread to write (TThread.Queue)
+    // and drops whatever is still queued when the program ends - so lines
+    // logged by RunParallel jobs and RunEx threads could go missing.
+    TLazLoggerFileAccess(DebugLogger).FileHandle :=
+      TLazLoggerFileHandleThreadSave.Create;
     // Hand this off to LazLogger's own logger instance rather than managing
     // a file handle ourselves - DebugLogger (from the LazLogger unit, already
     // in this unit's uses clause) owns the file, reopening/closing it as
@@ -2020,6 +2122,9 @@ begin
   // accumulate across runs so a rare failure isn't lost the next time the
   // app happens to launch cleanly.
   ErrorLogger := TLazLoggerFile.Create;
+  // Written straight from any thread - see InitializeDebugLog.
+  TLazLoggerFileAccess(ErrorLogger).FileHandle :=
+    TLazLoggerFileHandleThreadSave.Create;
   ErrorLogger.LogName := CombinePath(OpPath, FileName);
   // Same reasoning as DebugLogger above, and it matters even more here:
   // error.log is the one place a crash's last words are expected to
@@ -2121,9 +2226,16 @@ begin
   // via DebugLog below), ErrorLogger.DebugLn doesn't add one on its own -
   // and error.log is written in both Debug and Release builds, so it can't
   // rely on DebugLog's DEBUG-only formatting to supply it.
-  ErrorLogger.DebugLn(Format('[%s]',
-    [FormatDateTime('YYYY-MM-DD hh:nn:ss', Now)]) + LogMessage);
-  DebugLog(LogMessage); // debug.log too (Debug builds only); timestamps itself
+  // LogLock: see DebugLog. Critical sections are recursive, so DebugLog
+  // taking it again inside is fine.
+  System.EnterCriticalSection(LogLock);
+  try
+    ErrorLogger.DebugLn(Format('[%s]',
+      [FormatDateTime('YYYY-MM-DD hh:nn:ss', Now)]) + LogMessage);
+    DebugLog(LogMessage); // debug.log too (Debug builds only); timestamps itself
+  finally
+    System.LeaveCriticalSection(LogLock);
+  end;
 end;
 
 function MessageDlgEx(const AMsg: String; ADlgType: TMsgDlgType;
@@ -2251,10 +2363,9 @@ begin
   Result := CSVLines;
 end;
 
-function RemoveAllSpacesAndDots(s: String): String;
+function RemoveAllSpacesAndDots(const s: String): String;
 begin
-  s := ReplAllCI(s, '.', '');
-  Result := ReplAllCI(s, ' ', '');
+  Result := ReplAllCI(ReplAllCI(s, '.', ''), ' ', '');
 end;
 
 function RemoveDiacritics(const s: String): String;
@@ -2369,8 +2480,12 @@ end;
 // Configures, launches and drains an already-populated process. Both RunEx
 // forms funnel through here so options, error handling and pipe draining
 // exist in exactly one place. ADescription is for the error log only.
+// AStartError, when given (by a TRunExThread), receives the reason the
+// process couldn't be started instead of it being logged here, since
+// LogError must not be called from a worker thread.
 function RunExDrain(var AProc: TSmartProcess; const ADescription: String;
-  bRedirectErr: Boolean; out AExitCode: Integer): String;
+  bRedirectErr: Boolean; out AExitCode: Integer;
+  AStartError: PString = nil): String;
 const
   READ_BYTES = 4096;
 type
@@ -2395,7 +2510,10 @@ begin
   except
     on E: Exception do
     begin
-      LogError(sb(['RunEx could not start: ', ADescription]), E);
+      if Assigned(AStartError) then
+        AStartError^ := E.ClassName + ': ' + E.Message
+      else
+        LogError(sb(['RunEx could not start: ', ADescription]), E);
       Exit('');
     end;
   end;
@@ -2423,14 +2541,34 @@ begin
   Result := MS.AsString;
 end;
 
+// AStartError: see RunExDrain. Given only by a TRunExThread, which is also
+// why the command line isn't logged here then (its starter logs it).
+// ACurrentDir: the process's working directory ('' for the program's own).
 function RunExCore(const sCommandLine: String; bRedirectErr: Boolean;
-  out AExitCode: Integer): String;
+  out AExitCode: Integer; AStartError: PString = nil;
+  const ACurrentDir: String = ''): String;
 var
   Proc: TSmartProcess;
 begin
-  if IsDebugBuild then DebugLog(sb(['RunEx: ', sCommandLine]));
+  if IsDebugBuild and not Assigned(AStartError) then
+    DebugLog(sb(['RunEx: ', sCommandLine]));
   Proc.ParseCommandLine(sCommandLine);
-  Result := RunExDrain(Proc, sCommandLine, bRedirectErr, AExitCode);
+  if ACurrentDir <> '' then Proc.Value.CurrentDirectory := ACurrentDir;
+  Result := RunExDrain(Proc, sCommandLine, bRedirectErr, AExitCode,
+    AStartError);
+end;
+
+// Main thread only: what RunExCore leaves unlogged on a TRunExThread.
+procedure LogRunExStart(const sCommandLine: String);
+begin
+  if IsDebugBuild then DebugLog(sb(['RunEx (thread): ', sCommandLine]));
+end;
+
+procedure LogRunExStartError(const sCommandLine, AStartError: String);
+begin
+  if AStartError <> '' then
+    LogError(sb(['RunEx could not start: ', sCommandLine, ' - ',
+      AStartError]));
 end;
 
 type
@@ -2443,9 +2581,14 @@ type
     FBatchIndex: Integer;
     FCallback: TRunExCallback;
     FCommandLine: String;
+    FCurrentDir: String;
     FExitCode: Integer;
     FOutput: String;
     FRedirectErr: Boolean;
+    // Why the process couldn't be started ('' if it was). Logged on the
+    // main thread, once the thread is done (DoSingleCallback,
+    // TRunExBatchCoordinator.ThreadTerminated).
+    FStartError: String;
     procedure DoSingleCallback(Sender: TObject);
 
   protected
@@ -2453,11 +2596,13 @@ type
 
   public
     constructor Create(const ACommandLine: String; ARedirectErr: Boolean;
-      ACallback: TRunExCallback; ABatchIndex: Integer = -1);
+      ACallback: TRunExCallback; ABatchIndex: Integer = -1;
+      const ACurrentDir: String = '');
     property BatchIndex: Integer read FBatchIndex;
     property CommandLine: String read FCommandLine;
     property ExitCode: Integer read FExitCode;
     property Output: String read FOutput;
+    property StartError: String read FStartError;
   end;
 
   // Keeps up to AMaxConcurrency TRunExThread instances in flight at once
@@ -2467,6 +2612,7 @@ type
   TRunExBatchCoordinator = class
   private
     FCommandLines: array of String;
+    FCurrentDirs: array of String;
     FCompleteCallback: TRunExBatchCompleteCallback;
     FCompletedCount: Integer;
     FFailedCount: Integer;
@@ -2479,7 +2625,7 @@ type
     procedure ThreadTerminated(Sender: TObject);
 
   public
-    constructor Create(const ACommandLines: array of String;
+    constructor Create(const ACommandLines, ACurrentDirs: array of String;
       AItemCallback: TRunExBatchItemCallback;
       ACompleteCallback: TRunExBatchCompleteCallback;
       AMaxConcurrency: Integer; ARedirectErr: Boolean);
@@ -2514,7 +2660,8 @@ begin
 end;
 
 constructor TRunExThread.Create(const ACommandLine: String;
-  ARedirectErr: Boolean; ACallback: TRunExCallback; ABatchIndex: Integer);
+  ARedirectErr: Boolean; ACallback: TRunExCallback; ABatchIndex: Integer;
+  const ACurrentDir: String);
 begin
   inherited Create(True); // create suspended; caller starts it explicitly
   FreeOnTerminate := True;
@@ -2522,13 +2669,15 @@ begin
   FRedirectErr := ARedirectErr;
   FCallback := ACallback;
   FBatchIndex := ABatchIndex;
+  FCurrentDir := ACurrentDir;
   FExitCode := -1;
   if Assigned(FCallback) then OnTerminate := @DoSingleCallback;
 end;
 
 procedure TRunExThread.Execute;
 begin
-  FOutput := RunExCore(FCommandLine, FRedirectErr, FExitCode);
+  FOutput := RunExCore(FCommandLine, FRedirectErr, FExitCode, @FStartError,
+    FCurrentDir);
 end;
 
 // TThread.OnTerminate is always dispatched via Synchronize, so this (like
@@ -2536,16 +2685,19 @@ end;
 // thread and is safe to use for UI updates.
 procedure TRunExThread.DoSingleCallback(Sender: TObject);
 begin
+  LogRunExStartError(FCommandLine, FStartError);
   if Assigned(FCallback) then FCallback(FOutput, FExitCode);
 end;
 
 procedure RunExAsync(const sCommandLine: String; ACallback: TRunExCallback;
   bRedirectErr: Boolean = False);
 begin
+  LogRunExStart(sCommandLine);
   TRunExThread.Create(sCommandLine, bRedirectErr, ACallback).Start;
 end;
 
-constructor TRunExBatchCoordinator.Create(const ACommandLines: array of String;
+constructor TRunExBatchCoordinator.Create(
+  const ACommandLines, ACurrentDirs: array of String;
   AItemCallback: TRunExBatchItemCallback;
   ACompleteCallback: TRunExBatchCompleteCallback; AMaxConcurrency: Integer;
   ARedirectErr: Boolean);
@@ -2554,7 +2706,14 @@ var
 begin
   inherited Create;
   SetLength(FCommandLines, System.Length(ACommandLines));
-  for i := 0 to High(ACommandLines) do FCommandLines[i] := ACommandLines[i];
+  SetLength(FCurrentDirs, System.Length(ACommandLines));
+  for i := 0 to High(ACommandLines) do
+  begin
+    FCommandLines[i] := ACommandLines[i];
+    if i <= High(ACurrentDirs) then FCurrentDirs[i] := ACurrentDirs[i]
+    else
+      FCurrentDirs[i] := '';
+  end;
   FItemCallback := AItemCallback;
   FCompleteCallback := ACompleteCallback;
   FMaxConcurrency := AMaxConcurrency;
@@ -2576,8 +2735,9 @@ begin
     (FNextIndex < System.Length(FCommandLines)) do
   begin
     LThread := TRunExThread.Create(FCommandLines[FNextIndex],
-      FRedirectErr, nil, FNextIndex);
+      FRedirectErr, nil, FNextIndex, FCurrentDirs[FNextIndex]);
     LThread.OnTerminate := @ThreadTerminated;
+    LogRunExStart(FCommandLines[FNextIndex]);
     Inc(FNextIndex);
     LThread.Start;
   end;
@@ -2588,6 +2748,7 @@ var
   LThread: TRunExThread;
 begin
   LThread := TRunExThread(Sender);
+  LogRunExStartError(LThread.CommandLine, LThread.StartError);
   Inc(FCompletedCount);
   if LThread.ExitCode = 0 then Inc(FSucceededCount)
   else Inc(FFailedCount);
@@ -2620,8 +2781,293 @@ procedure RunExBatch(const ACommandLines: array of String;
   ACompleteCallback: TRunExBatchCompleteCallback; AMaxConcurrency: Integer;
   bRedirectErr: Boolean);
 begin
-  TRunExBatchCoordinator.Create(ACommandLines, AItemCallback,
+  TRunExBatchCoordinator.Create(ACommandLines, [], AItemCallback,
     ACompleteCallback, AMaxConcurrency, bRedirectErr).Start;
+end;
+
+procedure RunExBatch(const ACommandLines, ACurrentDirs: array of String;
+  AItemCallback: TRunExBatchItemCallback;
+  ACompleteCallback: TRunExBatchCompleteCallback; AMaxConcurrency: Integer;
+  bRedirectErr: Boolean);
+begin
+  TRunExBatchCoordinator.Create(ACommandLines, ACurrentDirs, AItemCallback,
+    ACompleteCallback, AMaxConcurrency, bRedirectErr).Start;
+end;
+
+type
+  // RunExBatchAndWait's side of a RunExBatch: collects the results. Lives
+  // until the batch's completion callback, which normally comes before
+  // RunExBatchAndWait returns; if it stopped waiting (a stall), the waiter
+  // is Abandoned instead and frees itself when the batch does finish, so a
+  // late callback never reaches freed memory.
+  TRunExWaiter = class
+  public
+    Abandoned: Boolean;
+    AllDone: Boolean;
+    DoneCount: Integer;
+    ExitCodes: TIntegerArray;
+    Outputs: TStringArray;
+    procedure ItemDone(AIndex: Integer; const {%H-}ACommandLine: String;
+      const AOutput: String; AExitCode: Integer);
+    procedure BatchDone({%H-}ASucceededCount, {%H-}AFailedCount: Integer);
+  end;
+
+procedure TRunExWaiter.ItemDone(AIndex: Integer; const ACommandLine: String;
+  const AOutput: String; AExitCode: Integer);
+begin
+  Inc(DoneCount);
+  if (AIndex < 0) or (AIndex > High(Outputs)) then Exit;
+  Outputs[AIndex] := AOutput;
+  ExitCodes[AIndex] := AExitCode;
+end;
+
+procedure TRunExWaiter.BatchDone(ASucceededCount, AFailedCount: Integer);
+begin
+  AllDone := True;
+  if Abandoned then Free;
+end;
+
+function RunExBatchAndWait(const ACommandLines, ACurrentDirs: array of String;
+  out AOutputs: TStringArray; out AExitCodes: TIntegerArray;
+  AMaxConcurrency: Integer; bRedirectErr: Boolean;
+  AOnProgress: TParallelProgress; AStallMs: QWord): Boolean;
+var
+  i, iCount, iLastDone: Integer;
+  LastProgress: QWord;
+  Waiter: TRunExWaiter;
+begin
+  Result := True;
+  iCount := System.Length(ACommandLines);
+  AOutputs := nil;
+  AExitCodes := nil;
+  SetLength(AOutputs, iCount);
+  SetLength(AExitCodes, iCount);
+  for i := 0 to iCount - 1 do AExitCodes[i] := -1;
+  if iCount = 0 then Exit;
+  Waiter := TRunExWaiter.Create;
+  SetLength(Waiter.Outputs, iCount);
+  SetLength(Waiter.ExitCodes, iCount);
+  for i := 0 to iCount - 1 do Waiter.ExitCodes[i] := -1;
+  try
+    RunExBatch(ACommandLines, ACurrentDirs, @Waiter.ItemDone,
+      @Waiter.BatchDone, AMaxConcurrency, bRedirectErr);
+  except
+    on E: Exception do
+    begin
+      // Not even started: nothing will call the waiter back, unless some
+      // threads did start - then it must stay, and free itself.
+      LogError('RunExBatchAndWait: could not start the batch', E);
+      Waiter.Abandoned := True;
+      Exit(False);
+    end;
+  end;
+  // Results arrive through TThread.Synchronize, which ProcessMessages
+  // services.
+  iLastDone := -1;
+  LastProgress := GetTickCount64;
+  while not Waiter.AllDone do
+  begin
+    Application.ProcessMessages;
+    if Waiter.DoneCount <> iLastDone then
+    begin
+      iLastDone := Waiter.DoneCount;
+      LastProgress := GetTickCount64;
+      if Assigned(AOnProgress) then AOnProgress(iLastDone, iCount);
+    end
+    else if (AStallMs > 0) and (GetTickCount64 - LastProgress >= AStallMs) then
+    begin
+      LogError(sb(['RunExBatchAndWait: nothing finished for ',
+        AStallMs div 1000, ' seconds; stopped waiting after ',
+        Waiter.DoneCount, ' of ', iCount, ' commands']));
+      Result := False;
+      Break;
+    end;
+    if not Waiter.AllDone then Sleep(10);
+  end;
+  for i := 0 to iCount - 1 do
+  begin
+    AOutputs[i] := Waiter.Outputs[i];
+    AExitCodes[i] := Waiter.ExitCodes[i];
+  end;
+  if Waiter.AllDone then Waiter.Free
+  else
+  begin
+    // Its outputs were just copied; whatever arrives from now on is
+    // dropped, and BatchDone frees it.
+    SetLength(Waiter.Outputs, 0);
+    SetLength(Waiter.ExitCodes, 0);
+    Waiter.Abandoned := True;
+  end;
+end;
+
+function ParallelThreadCount(AMax: Integer): Integer;
+begin
+  Result := Max(2, Min(AMax, Integer(TThread.ProcessorCount)));
+end;
+
+type
+  // What a RunParallel call's worker threads share. Only the main thread
+  // creates and frees it, after every worker has finished.
+  TParallelRun = class
+  public
+    Aborted: Boolean; // set by the main thread; read by the workers
+    Count: Integer;
+    Done: LongInt;    // InterLockedIncrement'ed by the workers
+    Errors: TStringArray; // one per job; '' unless it raised
+    Job: TParallelJob;
+    Next: LongInt;    // InterLockedIncrement'ed by the workers
+    // The job at the index handed out next, or -1 once there are none (or
+    // the run was cancelled). Called on the worker threads.
+    function TakeNext: Integer;
+    // Runs one job, catching anything it raises.
+    procedure RunJob(AIndex: Integer);
+  end;
+
+  TParallelWorker = class(TThread)
+  private
+    FRun: TParallelRun;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(ARun: TParallelRun);
+  end;
+
+function TParallelRun.TakeNext: Integer;
+begin
+  if Aborted then Exit(-1);
+  Result := InterLockedIncrement(Next) - 1;
+  if Result >= Count then Result := -1;
+end;
+
+procedure TParallelRun.RunJob(AIndex: Integer);
+begin
+  try
+    Job(AIndex);
+  except
+    on E: Exception do Errors[AIndex] := E.ClassName + ': ' + E.Message;
+  end;
+  InterLockedIncrement(Done);
+end;
+
+constructor TParallelWorker.Create(ARun: TParallelRun);
+begin
+  inherited Create(True); // started by RunParallel
+  FreeOnTerminate := False; // RunParallel waits for it and frees it
+  FRun := ARun;
+end;
+
+procedure TParallelWorker.Execute;
+var
+  i: Integer;
+begin
+  i := FRun.TakeNext;
+  while i >= 0 do
+  begin
+    FRun.RunJob(i);
+    i := FRun.TakeNext;
+  end;
+end;
+
+function RunParallel(ACount: Integer; AJob: TParallelJob;
+  AMaxThreads: Integer; AOnProgress: TParallelProgress;
+  ACancelCheck: TParallelCancelCheck): Integer;
+var
+  i, iLastDone, iThreads: Integer;
+  Run: TParallelRun;
+  Workers: array of TParallelWorker;
+
+  function AllWorkersFinished: Boolean;
+  var
+    w: TParallelWorker;
+  begin
+    for w in Workers do
+      if not w.Finished then Exit(False);
+    Result := True;
+  end;
+
+begin
+  Result := 0;
+  if (ACount <= 0) or not Assigned(AJob) then Exit;
+  Run := TParallelRun.Create;
+  Workers := nil;
+  try
+    Run.Count := ACount;
+    Run.Job := AJob;
+    SetLength(Run.Errors, ACount);
+    iThreads := Min(AMaxThreads, ACount);
+    // Start the workers. One that can't be created (no thread support, out
+    // of resources) just means fewer; with none at all, the loop below
+    // does every job here.
+    if iThreads > 1 then
+      for i := 1 to iThreads do
+      try
+        SetLength(Workers, System.Length(Workers) + 1);
+        Workers[High(Workers)] := TParallelWorker.Create(Run);
+        Workers[High(Workers)].Start;
+      except
+        on E: Exception do
+        begin
+          SetLength(Workers, System.Length(Workers) - 1);
+          DebugLog('RunParallel: could not start worker thread: ' +
+            E.Message);
+          Break;
+        end;
+      end;
+    if System.Length(Workers) = 0 then
+    begin
+      // On this thread, one job at a time, keeping the window alive.
+      i := Run.TakeNext;
+      while i >= 0 do
+      begin
+        Run.RunJob(i);
+        if Assigned(AOnProgress) then AOnProgress(Run.Done, ACount);
+        Application.ProcessMessages;
+        if Assigned(ACancelCheck) and ACancelCheck() then Run.Aborted := True;
+        i := Run.TakeNext;
+      end;
+    end
+    else
+    begin
+      iLastDone := -1;
+      while not AllWorkersFinished do
+      begin
+        Application.ProcessMessages;
+        if (not Run.Aborted) and Assigned(ACancelCheck) and ACancelCheck() then
+          Run.Aborted := True;
+        if Assigned(AOnProgress) and (Run.Done <> iLastDone) then
+        begin
+          iLastDone := Run.Done;
+          AOnProgress(iLastDone, ACount);
+        end;
+        Sleep(5);
+      end;
+      for i := 0 to High(Workers) do
+      begin
+        Workers[i].WaitFor;
+        FreeAndNil(Workers[i]);
+      end;
+      if Assigned(AOnProgress) and (Run.Done <> iLastDone) then
+        AOnProgress(Run.Done, ACount);
+    end;
+    Result := Run.Done;
+    for i := 0 to ACount - 1 do
+      if Run.Errors[i] <> '' then
+      begin
+        Dec(Result);
+        LogError(sb(['RunParallel: job ', i, ' failed - ', Run.Errors[i]]));
+      end;
+  finally
+    // Workers are only ever left here if an exception escaped the loop
+    // above; they still hold Run, so wait for them before freeing it.
+    for i := 0 to High(Workers) do
+      if Assigned(Workers[i]) then
+      begin
+        Run.Aborted := True;
+        Workers[i].WaitFor;
+        Workers[i].Free;
+      end;
+    Run.Free;
+  end;
 end;
 
 procedure SafeClearGridColumns(Grid: TDBGrid);
@@ -3077,6 +3523,8 @@ end;
 
 // =============================================================================
 initialization
+  InitCriticalSection(LogLock);
+  InitCriticalSection(ManifestLock);
   OpPath := AppendPathDelim(GetAppConfigDir(False));
   // Both loggers below open files inside OpPath. On a first run that
   // directory does not exist yet, and TForm1.Create's ForceDirectories call
@@ -3138,5 +3586,7 @@ initialization
 finalization
   // InitializeErrorLog constructs this; nothing was releasing it.
   FreeAndNil(ErrorLogger);
+  DoneCriticalSection(ManifestLock);
+  DoneCriticalSection(LogLock);
 
 end.
