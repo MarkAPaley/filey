@@ -23,8 +23,7 @@
     <VersionInfo>
       <UseVersionInfo Value="True"/>
       <MajorVersionNr Value="3"/>
-      <MinorVersionNr Value="1"/>
-      <BuildNr Value="800"/>
+      <MinorVersionNr Value="2"/>
       <StringTable CompanyName="Mark A Paley Software" FileDescription="Rename TV episode files consistently" LegalCopyright="Copyright (C) 2026 Mark A. Paley. GNU GPL version 2 or later." ProductName="filey"/>
     </VersionInfo>
     <BuildModes Active="Linux Release">
@@ -475,10 +474,9 @@ CustomOptions += &apos; -Fw&apos; + WpoDir + &apos;/&apos; + WpoName;"/>
         <Loaded Value="True"/>
         <LoadedDesigner Value="True"/>
         <UsageCount Value="82"/>
-        <IsVisibleTab Value="True"/>
         <EditorIndex Value="1"/>
-        <TopLine Value="9937"/>
-        <CursorPos Y="9971"/>
+        <TopLine Value="9938"/>
+        <CursorPos X="29" Y="9943"/>
         <Bookmarks Count="1">
           <Item0 Y="7897" Left="1" Top="7867" ID="1"/>
         </Bookmarks>
@@ -487,9 +485,10 @@ CustomOptions += &apos; -Fw&apos; + WpoDir + &apos;/&apos; + WpoName;"/>
         <Filename Value="uUtils.pas"/>
         <Loaded Value="True"/>
         <UsageCount Value="82"/>
+        <IsVisibleTab Value="True"/>
         <EditorIndex Value="4"/>
-        <TopLine Value="1743"/>
-        <CursorPos X="49" Y="1762"/>
+        <TopLine Value="3491"/>
+        <CursorPos X="30" Y="3520"/>
       </Unit>
       <Unit>
         <Filename Value="uDBF.pas"/>
