@@ -89,6 +89,19 @@ const
   LEN_TITLE = 100;
   LEN_PATH = LEN_MAX;
   LEN_DATE = 20;
+  // SHOWS.SORTKEY: as long as a title, the most a dBase index key holds.
+  LEN_SORTKEY = LEN_TITLE;
+
+  // SHOWS's alphabetical order. The index keeps the name TITLE - every
+  // caller already sets IndexName := SHOWS_ORDER_TAG ('TITLE') and the
+  // status bar shows "Sort:TITLE" - but is built on SORTKEY, which holds
+  // ShowsSortKey(TITLE). TDbf compares a key byte by byte, as if it were
+  // Windows-1252 text, so on the UTF-8 titles themselves every accented
+  // title sorted under "A" in a jumble; SORTKEY holds the title with its
+  // accents taken off, so "À La Carte" sorts with "A La Carte" and "Élite"
+  // with "Elite".
+  SHOWS_ORDER_TAG = 'TITLE';
+  SHOWS_ORDER_FIELDS = 'SORTKEY';
 
   LE = LineEnding;
 
@@ -208,11 +221,20 @@ type
     FReadOnlyReason: String;
     FSourcePath: String;
     FWorkingCopyDir: String;
+    // SHOWS: TITLE and SORTKEY, found when the table opens (nil for every
+    // other table), so DoBeforePost costs nothing elsewhere.
+    FSortKeyField: TField;
+    FSortTitleField: TField;
     procedure DoAccessChange;
     procedure ForgetRecordLock;
 
   protected
+    procedure DoAfterClose; override;
     procedure DoAfterEdit; override;
+    procedure DoAfterOpen; override;
+    // Keeps SORTKEY in step with TITLE for every row written, whichever
+    // code path writes it (imports, edits, RefreshShowsSearchKeys).
+    procedure DoBeforePost; override;
     procedure DoAfterScroll; override;
     procedure DoBeforeDelete; override;
     procedure DoBeforeEdit; override;
@@ -273,6 +295,17 @@ procedure SetupSchemaList(aDbf: TDbf);
 procedure SetupSchemaLog(aDbf: TDbf);
 procedure SetupSchemaShows(aDbf: TDbf);
 procedure SetupSchemaTempEps(aDbf: TDbf); // mirrors SetupSchemaEps
+
+// ===== SHOWS sort key =====
+// What SHOWS.SORTKEY holds for a title: the title with accents and other
+// marks taken off (uUtils.ASCIIFold: A for À, O for Ø, SS for ß, ...), a
+// leading Spanish ¡ or ¿ dropped, upper-cased. A title that folding
+// changed gets its own upper-cased spelling added after a space, so two
+// titles that differ only in accents ("Elite", "Élite") keep apart under
+// the unique TITLE index, as they did when it was built on TITLE itself.
+// Never longer than LEN_SORTKEY bytes, cut on a character boundary.
+// Filled in by TAccessDbf on every Post; nothing else needs to set it.
+function ShowsSortKey(const ATitle: String): String;
 
 // ===== Status / diagnostics =====
 // Multi-line diagnostic dump of a table's current properties (used by
@@ -360,6 +393,12 @@ function DbfMatchesSchema(const AFileName: String; ADbType: TDbType): Boolean;
 // field lengths are not compared, so copies made under older layouts
 // (ABOUT's VALUE was once 100 characters) are recognised too.
 function IsFileyTableLeftover(const AFileName: String): Boolean;
+
+// True if AFileName is a SHOWS table in the layout used before SORTKEY was
+// added (TITLE, DIRECTORY, SEARCHTHIS, LOOKUPDATE, HIDDEN and nothing
+// else), which uDBFManager.CreateAndOpenDBFs converts instead of
+// quarantining. Header only, as DbfMatchesSchema; never raises.
+function IsShowsWithoutSortKey(const AFileName: String): Boolean;
 
 implementation
 
@@ -505,6 +544,9 @@ begin
   aDbf.FieldDefs.Add('SEARCHTHIS', ftString, LEN_MAX, True);
   aDbf.FieldDefs.Add('LOOKUPDATE', ftString, LEN_DATE, True);
   aDbf.FieldDefs.Add('HIDDEN', ftBoolean);
+  // Last, so the grid (which shows the first three fields) doesn't change;
+  // see ShowsSortKey.
+  aDbf.FieldDefs.Add('SORTKEY', ftString, LEN_SORTKEY, True);
 end;
 
 procedure SetupSchemaTempEps(aDbf: TDbf);
@@ -514,7 +556,66 @@ begin
   SetupSchemaEps(aDbf);
 end;
 
+// S cut to at most AMaxBytes bytes, never inside a UTF-8 sequence.
+function Utf8CutBytes(const S: String; AMaxBytes: Integer): String;
+var
+  n: Integer;
+begin
+  if Length(S) <= AMaxBytes then Exit(S);
+  n := AMaxBytes;
+  // Back off continuation bytes (10xxxxxx) to the start of the character
+  // that doesn't fit, and leave it out.
+  while (n > 0) and ((Ord(S[n + 1]) and $C0) = $80) do Dec(n);
+  Result := Copy(S, 1, n);
+end;
+
+function ShowsSortKey(const ATitle: String): String;
+const
+  INVERTED_EXCLAMATION = #$C2#$A1; // U+00A1
+  INVERTED_QUESTION = #$C2#$BF;    // U+00BF
+var
+  sFolded, sPlain: String;
+begin
+  sPlain := UTF8UpperCase(Trim(ATitle));
+  sFolded := UTF8UpperCase(ASCIIFold(Trim(ATitle)));
+  // Spanish opening marks: "¡Mucha Lucha!" files under M.
+  while StartsStr(INVERTED_EXCLAMATION, sFolded) or
+    StartsStr(INVERTED_QUESTION, sFolded) do
+    sFolded := TrimLeft(Copy(sFolded, 3, MaxInt));
+  if sFolded = sPlain then
+    Result := sFolded
+  else
+    Result := sFolded + ' ' + sPlain;
+  Result := Utf8CutBytes(Result, LEN_SORTKEY);
+end;
+
 { TAccessDbf }
+
+procedure TAccessDbf.DoAfterOpen;
+begin
+  FSortTitleField := nil;
+  FSortKeyField := FindField(SHOWS_ORDER_FIELDS);
+  if Assigned(FSortKeyField) then
+  begin
+    FSortTitleField := FindField('TITLE');
+    if not Assigned(FSortTitleField) then FSortKeyField := nil;
+  end;
+  inherited DoAfterOpen;
+end;
+
+procedure TAccessDbf.DoAfterClose;
+begin
+  FSortKeyField := nil;
+  FSortTitleField := nil;
+  inherited DoAfterClose;
+end;
+
+procedure TAccessDbf.DoBeforePost;
+begin
+  if Assigned(FSortKeyField) then
+    FSortKeyField.AsString := ShowsSortKey(FSortTitleField.AsString);
+  inherited DoBeforePost;
+end;
 
 constructor TAccessDbf.Create(AOwner: TComponent);
 begin
@@ -903,13 +1004,17 @@ const
     (Name: 'TOPATH'; TypeChar: 'C'; Length: LEN_PATH),
     (Name: 'UNDO'; TypeChar: 'L'; Length: 1)
   );
-  EXPECTED_SHOWS: array[0..4] of TExpectedDbfField = (
+  EXPECTED_SHOWS: array[0..5] of TExpectedDbfField = (
     (Name: 'TITLE'; TypeChar: 'C'; Length: LEN_TITLE),
     (Name: 'DIRECTORY'; TypeChar: 'C'; Length: LEN_TITLE),
     (Name: 'SEARCHTHIS'; TypeChar: 'C'; Length: LEN_MAX),
     (Name: 'LOOKUPDATE'; TypeChar: 'C'; Length: LEN_DATE),
-    (Name: 'HIDDEN'; TypeChar: 'L'; Length: 1)
+    (Name: 'HIDDEN'; TypeChar: 'L'; Length: 1),
+    (Name: 'SORTKEY'; TypeChar: 'C'; Length: LEN_SORTKEY)
   );
+  // SHOWS as it was before SORTKEY: the first five fields of
+  // EXPECTED_SHOWS, and nothing after them (see IsShowsWithoutSortKey).
+  SHOWS_FIELDS_WITHOUT_SORTKEY = 5;
 
 // Raw dBase field descriptor, as laid out on disk. Classic dBase III/IV
 // uses a 32-byte descriptor (name at +0, type char at +11, length at
@@ -993,7 +1098,7 @@ end;
 // IsFileyTableLeftover needs: same field names in the same order, any
 // type and length.
 function DbfHeaderMatches(const AFileName: String; ADbType: TDbType;
-  ANamesOnly: Boolean): Boolean;
+  ANamesOnly: Boolean; AShowsFieldCount: Integer = -1): Boolean;
 var
   Descriptor: TRawFieldDescriptor;
   ExpectedCount, FieldDescSize, FieldDescStart, i: Integer;
@@ -1022,7 +1127,10 @@ begin
     dbEps, dbTempEps: ExpectedCount := Length(EXPECTED_EPS);
     dbList: ExpectedCount := Length(EXPECTED_LIST) + 1; // + TREELEVEL
     dbLog: ExpectedCount := Length(EXPECTED_LOG);
-    dbShows: ExpectedCount := Length(EXPECTED_SHOWS);
+    dbShows:
+      if AShowsFieldCount >= 0 then ExpectedCount := AShowsFieldCount
+      else
+        ExpectedCount := Length(EXPECTED_SHOWS);
     else
       Exit; // Unknown ADbType - fail safe rather than guess.
   end;
@@ -1112,6 +1220,12 @@ function DbfMatchesSchema(const AFileName: String; ADbType: TDbType):
   Boolean;
 begin
   Result := DbfHeaderMatches(AFileName, ADbType, False);
+end;
+
+function IsShowsWithoutSortKey(const AFileName: String): Boolean;
+begin
+  Result := DbfHeaderMatches(AFileName, dbShows, False,
+    SHOWS_FIELDS_WITHOUT_SORTKEY);
 end;
 
 function IsFileyTableLeftover(const AFileName: String): Boolean;

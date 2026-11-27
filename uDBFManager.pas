@@ -371,6 +371,124 @@ begin
   end;
 end;
 
+// Converts a SHOWS table in the layout used before SORTKEY (see
+// uDBF.IsShowsWithoutSortKey) to today's, keeping every row that isn't
+// deleted: the rows are copied into a new table built by SetupSchemaShows,
+// with SORTKEY filled in, and the new table takes the old one's name. The
+// old table goes to the backup folder (QuarantineFile), so nothing is
+// lost; its index file is deleted, since an index built on TITLE alone is
+// what SORTKEY replaces - SetupDbShows builds the new one. Returns False,
+// having logged why and left the old table where it was, if anything
+// fails before the swap.
+function ConvertShowsAddSortKey(const ADir, ATableName: String): Boolean;
+var
+  BaseName, NewName, NewFile, OldFile: String;
+  Copied: Integer = 0;
+  Dst, Src: TDbf;
+  F: TField;
+  i: Integer;
+
+  // Every index file named after ABase in ADir (the .MDX TDbf writes, in
+  // whatever letter case it came back with), so it can be deleted.
+  procedure DeleteIndexFiles(const ABase: String);
+  var
+    Found: TSearchRec;
+  begin
+    if FindFirst(TFilePath.Combine(ADir, '*').Value, faAnyFile, Found) = 0 then
+    try
+      repeat
+        if ((Found.Attr and faDirectory) = 0) and
+          SameText(ExtractFileNameOnly(Found.Name), ABase) and
+          SameText(ExtractFileExt(Found.Name), '.MDX') then
+          DeleteFile(TFilePath.Combine(ADir, Found.Name).Value);
+      until FindNext(Found) <> 0;
+    finally
+      FindClose(Found);
+    end;
+  end;
+
+begin
+  Result := False;
+  BaseName := ExtractFileNameOnly(ATableName);
+  OldFile := TFilePath.Combine(ADir, ATableName).Value;
+  NewName := BaseName + '_SORTKEY.DBF';
+  NewFile := TFilePath.Combine(ADir, NewName).Value;
+  // Leftovers of a conversion that was cut short.
+  DeleteFile(NewFile);
+  DeleteIndexFiles(BaseName + '_SORTKEY');
+  Src := TDbf.Create(nil);
+  Dst := TDbf.Create(nil);
+  try
+    try
+      Src.FilePathFull := ADir;
+      Src.TableName := ATableName;
+      Src.TableLevel := 7;
+      Src.ReadOnly := True;
+      Src.Open;
+      Dst.FilePathFull := ADir;
+      Dst.TableName := NewName;
+      Dst.TableLevel := 7;
+      Dst.StoreDefs := True;
+      SetupSchemaShows(Dst);
+      Dst.CreateTable;
+      Dst.Open;
+      Src.First;
+      while not Src.EOF do
+      begin
+        Dst.Append;
+        for i := 0 to Src.Fields.Count - 1 do
+        begin
+          F := Dst.FindField(Src.Fields[i].FieldName);
+          if Assigned(F) then F.Value := Src.Fields[i].Value;
+        end;
+        // A plain TDbf: TAccessDbf.DoBeforePost isn't there to do it.
+        Dst.FieldByName(SHOWS_ORDER_FIELDS).AsString :=
+          ShowsSortKey(Src.FieldByName('TITLE').AsString);
+        Dst.Post;
+        Inc(Copied);
+        Src.Next;
+      end;
+      Src.Close;
+      Dst.Close;
+    except
+      on E: Exception do
+      begin
+        LogError('ConvertShowsAddSortKey: could not convert "' + OldFile +
+          '"', E);
+        Src.Close;
+        Dst.Close;
+        DeleteFile(NewFile);
+        DeleteIndexFiles(BaseName + '_SORTKEY');
+        Exit;
+      end;
+    end;
+  finally
+    Src.Free;
+    Dst.Free;
+  end;
+  // The swap: the old table into the backup folder, then the new one
+  // under its name.
+  if not QuarantineFile(OldFile) then
+  begin
+    LogError('ConvertShowsAddSortKey: could not move "' + OldFile +
+      '" to the backup folder; it is left as it was.');
+    DeleteFile(NewFile);
+    Exit;
+  end;
+  DeleteIndexFiles(BaseName);
+  if not RenameFile(NewFile, OldFile) then
+  begin
+    LogError('ConvertShowsAddSortKey: could not rename "' + NewFile +
+      '" to "' + OldFile + '"; the old table is in the backup folder.');
+    Exit;
+  end;
+  // An index file of the new name, if TDbf made one (none is defined).
+  DeleteIndexFiles(BaseName + '_SORTKEY');
+  DebugLog(sb(['ConvertShowsAddSortKey: ', ATableName, ' converted (',
+    Copied, ' rows); the old table is in the backup folder.']));
+  Result := True;
+end;
+
 // Deletes rmWorkingCopy folders left behind by earlier runs that didn't
 // exit cleanly (a crash skips TAccessDbf.Destroy's cleanup). Only folders
 // whose name starts with this program's own prefix, and only ones more
@@ -479,6 +597,22 @@ begin
     // first, with nothing but bounds-checked byte access
     // (DbfMatchesSchema), is what lets a bad file be caught and handled
     // here instead.
+    // SHOWS from before SORTKEY: converted in place (rows kept), not
+    // quarantined like a table that doesn't match at all. A working copy
+    // is converted too - it is ours - but not a read-only original, which
+    // the mismatch handling below then leaves out for this run.
+    if (DbIndex = dbShows) and (db.Storage = stoFile) and TableFile.Exists and
+      not IsPhysicallyReadOnly(db) and IsShowsWithoutSortKey(TableFile) and
+      not ConvertShowsAddSortKey(ExtractFileDir(TableFile.Value),
+      ExtractFileName(TableFile.Value)) then
+    begin
+      LogError('CreateAndOpenDBFs: "' + TableFile.Value + '" could not be ' +
+        'converted to the layout with SORTKEY - skipping ' + db.TableName +
+        ' for this run (the table is unchanged).');
+      db.EnableControls;
+      Continue;
+    end;
+
     if (db.Storage = stoFile) and TableFile.Exists and
       not DbfMatchesSchema(TableFile, DbIndex) then
     begin

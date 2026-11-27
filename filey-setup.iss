@@ -7,25 +7,36 @@
 
 ; ----------------------------------------------------------------------------
 ; Where the files come from. No absolute paths, so this script works from
-; any checkout, from the Inno Setup IDE, and from filey-bundleme.sh, which
+; any checkout, from the Inno Setup IDE, and from src/bundleme.sh, which
 ; runs the command-line compiler (ISCC.exe) through Wine and passes:
 ;   /DFileySrc=<the src folder>         (no trailing backslash)
 ;   /DFileyExe=<the filey.exe to package>
+;   /DFileyArch=win64 or win32          (which build; default win64)
 ; Without them, the src folder is found from where this script is: either
 ; this folder itself, or a "src" folder inside it.
 ; ----------------------------------------------------------------------------
+#ifndef FileyArch
+  #define FileyArch "win64"
+#endif
+#if FileyArch == "win64"
+  #define FileyBinDir "bin\x86_64-win64\"
+#elif FileyArch == "win32"
+  #define FileyBinDir "bin\i386-win32\"
+#else
+  #error FileyArch must be win64 or win32
+#endif
 #ifndef FileySrc
-  #if FileExists(AddBackslash(SourcePath) + "bin\x86_64-win64\" + MyAppExeName)
+  #if FileExists(AddBackslash(SourcePath) + FileyBinDir + MyAppExeName)
     #define FileySrc RemoveBackslash(SourcePath)
-  #elif FileExists(AddBackslash(SourcePath) + "src\bin\x86_64-win64\" + MyAppExeName)
+  #elif FileExists(AddBackslash(SourcePath) + "src\" + FileyBinDir + MyAppExeName)
     #define FileySrc AddBackslash(SourcePath) + "src"
   #else
-    #error filey.exe not found in bin\x86_64-win64 next to this script or in its src folder - build the Win64 mode first, or pass /DFileySrc=
+    #error filey.exe not found in the build folder for FileyArch next to this script or in its src folder - build that mode first, or pass /DFileySrc=
   #endif
 #endif
 #define SrcDir AddBackslash(FileySrc)
 #ifndef FileyExe
-  #define FileyExe SrcDir + "bin\x86_64-win64\" + MyAppExeName
+  #define FileyExe SrcDir + FileyBinDir + MyAppExeName
 #endif
 
 #define MyAppVersion GetVersionNumbersString(FileyExe)
@@ -55,6 +66,7 @@ AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
+#if FileyArch == "win64"
 ; "ArchitecturesAllowed=x64compatible" specifies that Setup cannot run
 ; on anything but x64 and Windows 11 on Arm.
 ArchitecturesAllowed=x64compatible
@@ -63,15 +75,19 @@ ArchitecturesAllowed=x64compatible
 ; meaning it should use the native 64-bit Program Files directory and
 ; the 64-bit view of the registry.
 ArchitecturesInstallIn64BitMode=x64compatible
+#endif
+; The win32 build has neither line: it installs, in 32-bit mode, on any
+; Windows. Both builds share the AppId above, so either one replaces the
+; other rather than installing beside it.
 ; Uncomment the following line to use a 64-bit installer.
 ;SetupArchitecture=x64
 DisableProgramGroupPage=yes
 LicenseFile={#SrcDir}license.txt
 ; Remove the following line to run in administrative install mode (install for all users).
 PrivilegesRequired=lowest
-; filey-bundleme.sh overrides this with ISCC's /O switch.
+; src/bundleme.sh overrides this with ISCC's /O switch.
 OutputDir={#SrcDir}releases
-OutputBaseFilename={#MyAppVerName}-setup-win64
+OutputBaseFilename={#MyAppVerName}-setup-{#FileyArch}
 SetupIconFile={#SrcDir}filey.ico
 SolidCompression=yes
 WizardStyle=modern dynamic

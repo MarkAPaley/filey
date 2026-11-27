@@ -144,6 +144,20 @@ const
     ['<', '>', ':', '"', '/', '\', '|', '?', '*', #0..#31, #127];
   LIBEAY_NAME = 'libeay32.dll'; //Needed for Windows connectivity
   SSLEAY_NAME = 'ssleay32.dll';
+  // The entries in filey-src.zip that this build's LIBEAY_NAME and
+  // SSLEAY_NAME are extracted from. The zip carries both CPUs' DLLs (one
+  // filey.res serves every build mode): the x86-64 ones under their own
+  // names, the i386 ones as *-i386.dll. On disk they are always
+  // LIBEAY_NAME/SSLEAY_NAME, so a win32 build run where a win64 build ran
+  // before (same %LOCALAPPDATA%\filey) finds the 64-bit copies not matching
+  // its zip entry, and replaces them - see SourceZipEntryName.
+  {$IFDEF CPUI386}
+  LIBEAY_ZIP_NAME = 'libeay32-i386.dll';
+  SSLEAY_ZIP_NAME = 'ssleay32-i386.dll';
+  {$ELSE}
+  LIBEAY_ZIP_NAME = LIBEAY_NAME;
+  SSLEAY_ZIP_NAME = SSLEAY_NAME;
+  {$ENDIF}
 
 var
   // The canonical, single source of truth for the app's config/data
@@ -298,6 +312,12 @@ function IsEmptyRecord(const Fields: TStringList): Boolean;
 // existing ADiskFileName counts as current.
 function IsExtractedFileCurrent(
   const AZipFileName, AArchiveFileName, ADiskFileName: String): Boolean;
+
+// The filey-src.zip entry that the file ADiskName (a bare name, as it is
+// called in OpPath) is extracted from: LIBEAY_ZIP_NAME/SSLEAY_ZIP_NAME for
+// the OpenSSL DLLs, which differ by CPU; ADiskName itself for everything
+// else.
+function SourceZipEntryName(const ADiskName: String): String;
 
 function IsGridEmpty(const AGrid: TDBGrid): Boolean;
 function IsNativeWin32Control(const ACtrl: TWinControl): Boolean;
@@ -835,6 +855,15 @@ begin
   // The sure way, once; recorded so that next time is the quick way.
   Result := FileCRC32(ADiskFileName, DiskCRC) and (DiskCRC = EntryCRC);
   if Result then WriteManifestEntry(ADiskFileName, EntryCRC);
+end;
+
+function SourceZipEntryName(const ADiskName: String): String;
+begin
+  // CompareText: the names are ASCII, and Windows (the only place the DLLs
+  // are used) ignores case.
+  if CompareText(ADiskName, LIBEAY_NAME) = 0 then Result := LIBEAY_ZIP_NAME
+  else if CompareText(ADiskName, SSLEAY_NAME) = 0 then Result := SSLEAY_ZIP_NAME
+  else Result := ADiskName;
 end;
 
 function MoveFileOver(const ASourceFileName, ADestFileName: String): Boolean;
@@ -1686,12 +1715,14 @@ begin
       FileStream.Setup(CombinePath(OpPath, SourceZipFileName), fmCreate);
       FileStream.Value.CopyFrom(ResStream.Value, ResStream.Value.Size);
     end;
+    // From this CPU's entries (LIBEAY_ZIP_NAME/SSLEAY_ZIP_NAME): a win32
+    // build must never be handed the x86-64 DLLs.
     if not FileExists(DiskLibeay) then
       ExtractFromZipIfNotFound(CombinePath(OpPath, SourceZipFileName),
-        LIBEAY_NAME, DiskLibeay);
+        LIBEAY_ZIP_NAME, DiskLibeay);
     if not FileExists(DiskSsleay) then
       ExtractFromZipIfNotFound(CombinePath(OpPath, SourceZipFileName),
-        SSLEAY_NAME, DiskSsleay);
+        SSLEAY_ZIP_NAME, DiskSsleay);
   except
     on E: Exception do LogError(
         'EnsureOpenSSLDllsPresent: extraction attempt failed', E);

@@ -2137,9 +2137,12 @@ const
     'filey.lpi',
     'filey.lpr', 'filey64.png', 'license.txt', 'Privacy_Policy.html',
     'README.html', 'README.md', 'README2.html', 'README2.md');
-  cResourceFiles: array[0..4] of String = (
-    'ffprobe.exe', 'libeay32.dll', 'mkvmerge.exe',
-    'mkvpropedit.exe', 'ssleay32.dll');
+  // libeay32/ssleay32 are the x86-64 OpenSSL 1.0.2u DLLs, the *-i386 ones
+  // the 32-bit builds of the same (both from IndySockets/OpenSSL-Binaries);
+  // see uUtils.LIBEAY_ZIP_NAME for which build extracts which.
+  cResourceFiles: array[0..6] of String = (
+    'ffprobe.exe', 'libeay32.dll', 'libeay32-i386.dll', 'mkvmerge.exe',
+    'mkvpropedit.exe', 'ssleay32.dll', 'ssleay32-i386.dll');
   // The files in g.SourcePath that building Filey needs - what
   // SourceListChecked expects to find in cSourceFiles.
   cSourceMasks = '*.pas;*.pp;*.inc;*.lfm;*.lpr;*.lpi';
@@ -5946,19 +5949,21 @@ end;
 function TForm1.ExtractFromSourceZip(const AFileName: String;
   AOnlyIfMissing: Boolean): Boolean;
 var
-  DiskFileName, ZipFileName: String;
+  DiskFileName, EntryName, ZipFileName: String;
   Progress: Zipper.TProgressEvent;
 begin
   // Wrapper lives on TForm1 so uUtils doesn't need access to the g global
   // (source zip path comes from g).
   DiskFileName := CombinePath(g.OpPath, AFileName);
+  // Usually AFileName itself; the OpenSSL DLLs come from this CPU's entry.
+  EntryName := uUtils.SourceZipEntryName(AFileName);
   ZipFileName := g.FilePathSourceZip.Value;
   // Already there (and current): nothing to extract, so nothing to show.
   if AOnlyIfMissing then
   begin
     if FileExists(DiskFileName) then Exit(True);
   end
-  else if uUtils.IsExtractedFileCurrent(ZipFileName, AFileName,
+  else if uUtils.IsExtractedFileCurrent(ZipFileName, EntryName,
     DiskFileName) then Exit(True);
   // Outside CheckResourceFiles (a tool re-discovered by EnsureToolAvailable
   // in the middle of a rename, the Linux desktop icon, ...) this stays
@@ -5970,7 +5975,7 @@ begin
     ShowExtractProgress(AFileName);
     Progress := @ZipperProgress;
   end;
-  Result := uUtils.ReplaceFromZip(ZipFileName, AFileName, DiskFileName,
+  Result := uUtils.ReplaceFromZip(ZipFileName, EntryName, DiskFileName,
     Progress);
   if Result and FIsCheckingResources then Inc(FExtractedCount);
 end;
@@ -6007,7 +6012,7 @@ begin
     if bOnlyIfMissing then bCurrent := FileExists(sDisk)
     else
       bCurrent := uUtils.IsExtractedFileCurrent(g.FilePathSourceZip.Value,
-        ANames[i], sDisk);
+        uUtils.SourceZipEntryName(ANames[i]), sDisk);
     Result[i] := bCurrent;
     if not bCurrent then
     begin
@@ -6033,7 +6038,9 @@ begin
   sNames := '';
   for iJob := 0 to High(Todo) do
   begin
-    FExtractNames[iJob] := ANames[Todo[iJob]];
+    // FExtractNames holds zip entry names, FExtractDisks the files they
+    // become (the same name, bar this CPU's OpenSSL DLLs).
+    FExtractNames[iJob] := uUtils.SourceZipEntryName(ANames[Todo[iJob]]);
     FExtractDisks[iJob] := CombinePath(g.OpPath, ANames[Todo[iJob]]);
     sNames := sb([sNames, IfThen(sNames.IsEmpty, '', ', '),
       ANames[Todo[iJob]]]);
@@ -6351,8 +6358,10 @@ begin
   UI.Check;
   PackThisTable(aDB);
   DBFRecordCountChanged(aDB);
-  AddIndexExclusive(aDB, 'TITLE', 'TITLE', [ixCaseInsensitive, ixunique]);
-  aDB.IndexName := 'TITLE';
+  // On SORTKEY, which TAccessDbf filled in as each row was posted.
+  AddIndexExclusive(aDB, SHOWS_ORDER_TAG, SHOWS_ORDER_FIELDS,
+    [ixCaseInsensitive, ixunique]);
+  aDB.IndexName := SHOWS_ORDER_TAG;
   // Every row was just keyed by ImportShowsRows with the current Key, so
   // RefreshShowsSearchKeys has nothing to do.
   SearchKeysAreCurrent;
@@ -10125,7 +10134,18 @@ begin
   db.IndexDefs.Update;
   HasTitle := False;
   for i := 0 to db.IndexDefs.Count - 1 do
-    if SameText(db.IndexDefs[i].Name, 'TITLE') then HasTitle := True;
+    if SameText(db.IndexDefs[i].Name, SHOWS_ORDER_TAG) then
+      // Only the TITLE index built on SORTKEY counts: one left from before
+      // SORTKEY (built on TITLE itself) sorts accented titles wrongly and
+      // is rebuilt below.
+      if SameText(Trim(db.IndexDefs[i].Expression), SHOWS_ORDER_FIELDS) then
+        HasTitle := True
+      else if not IsPhysicallyReadOnly(db) then
+      begin
+        db.IndexName := '';
+        DeleteIndexIfPresentExclusive(db, SHOWS_ORDER_TAG);
+        Break;
+      end;
   if not HasTitle then
   begin
     if IsPhysicallyReadOnly(db) then
@@ -10138,8 +10158,9 @@ begin
     else
     begin
       db.IndexDefs.Clear;
-      AddIndexExclusive(db, 'TITLE', 'TITLE', [ixCaseInsensitive, ixunique]);
-      db.IndexName := 'TITLE';
+      AddIndexExclusive(db, SHOWS_ORDER_TAG, SHOWS_ORDER_FIELDS,
+        [ixCaseInsensitive, ixunique]);
+      db.IndexName := SHOWS_ORDER_TAG;
       db.RegenerateIndexes;
     end;
     db.First;
